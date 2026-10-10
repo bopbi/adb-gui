@@ -1,0 +1,22 @@
+# Rust build artifacts (workspace-shared target dir)
+/target
+**/*.rs.bk
+*.pdb
+
+# Keep Cargo.lock tracked — this is an application, not a library.
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Local env / secrets
+.env
+.env.*
+
+# Note: plan/ is deliberately NOT ignored — it stays untracked but visible.
