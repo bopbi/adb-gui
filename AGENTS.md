@@ -40,8 +40,24 @@ them locally.
 
 ## Conventions
 
-To be filled in as the project takes shape. Update this file once the manifest,
-source layout, and tooling land.
+- Cargo workspace, Rust edition 2024. Two crates:
+  - `crates/adb-core` — headless library; the **only** crate that spawns
+    processes. All device I/O goes through `AdbClient` / `find_adb` /
+    `spawn_device_watcher` here.
+  - `crates/adb-gui` — the GPUI application (presentation only; no process
+    spawning, no adb logic).
+- Dependencies are deliberate and minimal (`adb-core` currently: `thiserror`
+  only). Do not add `tokio`, `regex`, `serde`, or an async runtime without a
+  plan that justifies it — sync `std` + threads suffices.
+- Commands:
+  - `cargo build` — build the workspace
+  - `cargo test -p adb-core` — unit tests (fast, no device needed)
+  - `cargo clippy --workspace -- -D warnings` — lint gate
+  - `cargo fmt --check` — format gate
+  - Device integration tests (opt-in, need a real device/emulator):
+    `ADB_GUI_TEST_DEVICE=1 cargo test -p adb-core --features device-it -- --ignored`
+- Tests use fixture strings and fake adb shell scripts; unit tests never touch
+  a real SDK or device.
 
 ## Working agreements
 
