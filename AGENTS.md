@@ -12,9 +12,23 @@ otherwise type as `adb shell ...` incantations: device state, appearance
 (dark mode, font scale, locale/RTL), network throttling, screenshots, app
 management, and similar.
 
-The repository is at its earliest stage: no source tree or build system exists
-yet. As the stack is chosen, record the real build/test/lint commands below and
-keep this file up to date.
+The chosen stack is **Rust** with the
+[`gpui-kit`](https://github.com/longbridge/gpui-kit) crate (GPUI + component
+library) for the GUI, driving the system `adb` binary. The repository is at
+its earliest stage: no source tree or build system exists yet. As the stack
+lands, record the real build/test/lint commands below and keep this file up
+to date.
+
+## Skills
+
+Before writing or reviewing any GPUI code, read
+`.agents/skills/gpui-kit/SKILL.md` and its `references/coding-guides.md` —
+they are the normative source for architecture, state ownership, public API,
+naming, and testing decisions (including `#[gpui_kit::test]` UI integration
+testing). Use `.agents/skills/gpui-kit-design-guides/` for any visible-surface
+decision (layout, spacing, color, component choice, copy). The skills are
+vendored from upstream and pinned in `.agents/skills/PINNED.md`; do not edit
+them locally.
 
 ## Environment
 
