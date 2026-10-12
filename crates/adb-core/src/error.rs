@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdbError {
     #[error("Android SDK not found; set ANDROID_HOME or ANDROID_SDK_ROOT, or put adb on PATH")]
@@ -6,8 +8,8 @@ pub enum AdbError {
     #[error("device offline: {serial}")]
     DeviceOffline { serial: String },
 
-    #[error("adb command timed out after 30s: {command}")]
-    Timeout { command: String },
+    #[error("adb command timed out after {timeout:?}: {command}")]
+    Timeout { command: String, timeout: Duration },
 
     #[error("adb command failed: {command}: {stderr}")]
     CommandFailed { command: String, stderr: String },

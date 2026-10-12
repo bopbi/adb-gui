@@ -6,3 +6,8 @@ license.workspace = true
 description = "GPUI desktop GUI for everyday adb operations"
 
 [dependencies]
+adb-core = { path = "../adb-core" }
+gpui-kit = "=0.7.1"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.1", features = ["test-support"] }

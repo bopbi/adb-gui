@@ -112,19 +112,6 @@ fn apply_line(devices: &mut BTreeMap<String, DeviceState>, line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn script(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("adb-gui-track-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
-        path
-    }
 
     #[test]
     fn apply_line_upserts_and_reports_change() {
@@ -149,93 +136,115 @@ mod tests {
         assert_eq!(map.len(), 2);
     }
 
-    #[test]
-    fn watcher_streams_snapshots_and_exits_when_receiver_drops() {
-        // The fake adb prints an initial list, then one state change, then
-        // exits; the watcher must stream both snapshots and end the thread
-        // when the receiver is dropped (detected at the post-EOF probe).
-        let adb = script(
-            "fake-track-devices",
-            r#"printf 'emulator-5554\tdevice\nphone-1\tdevice\n'
+    // The watcher tests drive a fake adb shell script; they are Unix-only
+    // (matching client.rs's `#[cfg(all(test, unix))]`). The pure `apply_line`
+    // test above stays cross-platform.
+    #[cfg(unix)]
+    mod watcher {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn script(name: &str, body: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("adb-gui-track-test-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+            path
+        }
+
+        #[test]
+        fn watcher_streams_snapshots_and_exits_when_receiver_drops() {
+            // The fake adb prints an initial list, then one state change, then
+            // exits; the watcher must stream both snapshots and end the thread
+            // when the receiver is dropped (detected at the post-EOF probe).
+            let adb = script(
+                "fake-track-devices",
+                r#"printf 'emulator-5554\tdevice\nphone-1\tdevice\n'
 sleep 0.2
 printf 'phone-1\toffline\n'
 exit 0"#,
-        );
+            );
 
-        let (handle, rx) = spawn_device_watcher(adb);
+            let (handle, rx) = spawn_device_watcher(adb);
 
-        // adb sends one line per change, so snapshots arrive incrementally;
-        // wait until the offline transition lands.
-        let mut saw_full_list = false;
-        let mut saw_offline = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !saw_offline {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let snapshot = rx.recv_timeout(remaining).expect("snapshot timed out");
-            if snapshot.len() == 2 {
-                saw_full_list = true;
-            }
-            if let Some(phone) = snapshot.iter().find(|d| d.serial == "phone-1") {
-                if phone.state == DeviceState::Offline {
+            // adb sends one line per change, so snapshots arrive incrementally;
+            // wait until the offline transition lands.
+            let mut saw_full_list = false;
+            let mut saw_offline = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !saw_offline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let snapshot = rx.recv_timeout(remaining).expect("snapshot timed out");
+                if snapshot.len() == 2 {
+                    saw_full_list = true;
+                }
+                if let Some(phone) = snapshot.iter().find(|d| d.serial == "phone-1")
+                    && phone.state == DeviceState::Offline
+                {
                     saw_offline = true;
                 }
             }
+            assert!(saw_full_list, "never saw the two-device snapshot");
+            assert!(saw_offline, "never saw the offline transition");
+
+            drop(rx); // receiver gone: watcher must exit at the next send
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(handle.join());
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("watcher thread did not exit after receiver drop")
+                .expect("watcher thread panicked");
         }
-        assert!(saw_full_list, "never saw the two-device snapshot");
-        assert!(saw_offline, "never saw the offline transition");
 
-        drop(rx); // receiver gone: watcher must exit at the next send
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(handle.join());
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("watcher thread did not exit after receiver drop")
-            .expect("watcher thread panicked");
-    }
-
-    #[test]
-    fn watcher_respawns_dead_adb() {
-        let counter =
-            std::env::temp_dir().join(format!("adb-gui-track-counter-{}", std::process::id()));
-        let _ = fs::remove_file(&counter);
-        let adb = script(
-            "fake-track-respawn",
-            r#"echo x >> "$ADB_GUI_TRACK_COUNTER"
+        #[test]
+        fn watcher_respawns_dead_adb() {
+            let counter =
+                std::env::temp_dir().join(format!("adb-gui-track-counter-{}", std::process::id()));
+            let _ = fs::remove_file(&counter);
+            let adb = script(
+                "fake-track-respawn",
+                r#"echo x >> "$ADB_GUI_TRACK_COUNTER"
 printf 'emulator-5554\tdevice\n'
 exit 0"#,
-        );
-        // Safety: read only by the fake adb spawned by this test.
-        unsafe { std::env::set_var("ADB_GUI_TRACK_COUNTER", &counter) };
+            );
+            // Safety: read only by the fake adb spawned by this test.
+            unsafe { std::env::set_var("ADB_GUI_TRACK_COUNTER", &counter) };
 
-        let (handle, rx) = spawn_device_watcher(adb);
-        rx.recv().expect("initial snapshot");
+            let (handle, rx) = spawn_device_watcher(adb);
+            rx.recv().expect("initial snapshot");
 
-        // adb exits after each print; the watcher should respawn it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut invocations = 1u32;
-        while invocations < 2 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(200));
-            invocations = fs::read_to_string(&counter)
-                .map(|s| s.lines().count() as u32)
-                .unwrap_or(0);
+            // adb exits after each print; the watcher should respawn it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut invocations = 1u32;
+            while invocations < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                invocations = fs::read_to_string(&counter)
+                    .map(|s| s.lines().count() as u32)
+                    .unwrap_or(0);
+            }
+            assert!(
+                invocations >= 2,
+                "adb was respawned only {invocations} time(s)"
+            );
+
+            drop(rx);
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(handle.join());
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("watcher did not exit")
+                .expect("watcher panicked");
+            unsafe { std::env::remove_var("ADB_GUI_TRACK_COUNTER") };
+            let _ = fs::remove_file(&counter);
         }
-        assert!(
-            invocations >= 2,
-            "adb was respawned only {invocations} time(s)"
-        );
-
-        drop(rx);
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(handle.join());
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("watcher did not exit")
-            .expect("watcher panicked");
-        unsafe { std::env::remove_var("ADB_GUI_TRACK_COUNTER") };
-        let _ = fs::remove_file(&counter);
     }
 }

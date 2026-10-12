@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::device::{Device, parse_devices};
 use crate::error::{AdbError, Result};
 
-const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The single owner of the adb process boundary. Construct one from a path
@@ -16,11 +16,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[derive(Debug, Clone)]
 pub struct AdbClient {
     pub adb_path: PathBuf,
+    timeout: Duration,
 }
 
 impl AdbClient {
     pub fn new(adb_path: PathBuf) -> Self {
-        Self { adb_path }
+        Self::with_timeout(adb_path, DEFAULT_TIMEOUT)
+    }
+
+    /// Like [`AdbClient::new`] with a custom per-command watchdog timeout.
+    pub fn with_timeout(adb_path: PathBuf, timeout: Duration) -> Self {
+        Self { adb_path, timeout }
     }
 
     /// `adb devices -l`, parsed. Skips malformed rows.
@@ -69,7 +75,7 @@ impl AdbClient {
         let stdout = spawn_drain(child.stdout.take().expect("piped stdout"));
         let stderr = spawn_drain(child.stderr.take().expect("piped stderr"));
 
-        let status = wait_with_watchdog(&mut child, &command)?;
+        let status = wait_with_watchdog(&mut child, &command, self.timeout)?;
 
         let stdout = stdout.join().expect("stdout drain panicked")?;
         let stderr = stderr.join().expect("stderr drain panicked")?;
@@ -77,9 +83,17 @@ impl AdbClient {
         if let Some(code) = status.code()
             && code != 0
         {
+            let stderr_text = String::from_utf8_lossy(&stderr).trim().to_string();
+            // adb reports an unreachable device on stderr ("error: device
+            // offline"); give the UI a specific variant for that case.
+            if stderr_text.contains("offline")
+                && let Some(serial) = serial_of(args)
+            {
+                return Err(AdbError::DeviceOffline { serial });
+            }
             return Err(AdbError::CommandFailed {
                 command,
-                stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+                stderr: stderr_text,
             });
         }
 
@@ -101,8 +115,8 @@ fn spawn_drain<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<std::io::R
 }
 
 /// Poll the child until it exits or the watchdog fires; kill on timeout.
-fn wait_with_watchdog(child: &mut Child, command: &str) -> Result<ExitStatus> {
-    let deadline = Instant::now() + WATCHDOG_TIMEOUT;
+fn wait_with_watchdog(child: &mut Child, command: &str, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -112,10 +126,19 @@ fn wait_with_watchdog(child: &mut Child, command: &str) -> Result<ExitStatus> {
             let _ = child.wait();
             return Err(AdbError::Timeout {
                 command: command.to_string(),
+                timeout,
             });
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The `-s <serial>` argument pair, when present (all per-device commands
+/// include it).
+fn serial_of(args: &[&str]) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == "-s")
+        .map(|window| window[1].to_string())
 }
 
 #[cfg(all(test, unix))]
@@ -224,15 +247,35 @@ fi"#,
     }
 
     #[test]
+    fn offline_stderr_maps_to_device_offline() {
+        let adb = script(
+            "fake-adb-offline",
+            r#"echo 'error: device offline' >&2; exit 1"#,
+        );
+        let client = AdbClient::new(adb);
+        let err = client.shell("serial123", &["echo", "hi"]).unwrap_err();
+        match err {
+            AdbError::DeviceOffline { serial } => assert_eq!(serial, "serial123"),
+            other => panic!("expected DeviceOffline, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn slow_command_maps_to_timeout() {
         let adb = script("fake-adb-slow", "sleep 60");
-        let client = AdbClient::new(adb);
+        // A short watchdog keeps the suite fast; the default stays 30 s.
+        let client = AdbClient::with_timeout(adb, Duration::from_millis(100));
         let start = Instant::now();
         let err = client.shell("s", &["sleep"]).unwrap_err();
-        assert!(matches!(err, AdbError::Timeout { .. }));
+        match err {
+            AdbError::Timeout { timeout, .. } => {
+                assert_eq!(timeout, Duration::from_millis(100));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
         assert!(
-            start.elapsed() < Duration::from_secs(35),
-            "watchdog should fire near 30s, took {:?}",
+            start.elapsed() < Duration::from_secs(5),
+            "watchdog should fire near 100ms, took {:?}",
             start.elapsed()
         );
     }
