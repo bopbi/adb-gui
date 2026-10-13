@@ -10,9 +10,10 @@ the canonical patterns. Load vendored references only for the topic at hand.
 
 ## Read first, in this order
 
-1. `crates/adb-gui/src/feature.rs` — the `Feature` trait (`feature.rs:46`),
-   `FeatureRegistry`, `all_features()` (`feature.rs:81`), and
-   `SampleDarkModeToggle` (`feature.rs:88`) as the worked example.
+1. `crates/adb-gui/src/feature.rs` — the `Feature` trait, `FeatureKind`
+   (with `StepperSpec`), `FeatureRegistry` with sections.
+   `crates/adb-gui/src/features/dark_mode.rs` — the simplest worked example
+   (`apply` for the batched read, `perform` for the write).
 2. `crates/adb-gui/src/executor.rs` — the `FeatureExecutor` seam
    (`executor.rs:10`) and `AdbExecutor` (`executor.rs:30`).
 3. `crates/adb-gui/src/device_store.rs` — store snapshot/selection rules;
@@ -25,25 +26,29 @@ the canonical patterns. Load vendored references only for the topic at hand.
 
 ## Adding a feature (the parts 04–06 recipe)
 
-1. Write a small struct implementing `Feature` in `feature.rs` — copy
-   `SampleDarkModeToggle`. Declare `kind()`, and implement `read_state` /
-   `perform` as adb command sequences through the passed `&AdbClient`.
-2. Register one `Arc::new(...)` in `all_features()`. Nothing else changes:
-   the grid, picker gating, executor dispatch, and error notifications are
-   already generic over `FeatureKind` (`Toggle`, `Stepper`, `Choice`,
-   `Action`, `TextAction`). New `FeatureKind` variants render as disabled
-   placeholders until `AppView::render_feature_cell` handles them.
-3. `Availability::EmulatorOnly` features: guard `read_state`/`perform`
-   against physical devices (check `serial` prefix or surface a clear error);
-   the shell does not gate availability yet.
+1. Write a small struct implementing `Feature` in a module under
+   `src/features/` — copy `dark_mode.rs` (simplest) or `display_size.rs`
+   (stepper with reset). Declare `kind()` and implement `perform` as adb
+   command sequences through the passed `&AdbClient`. There is NO
+   `read_state`: readable values join the fixed query table in
+   `state_reader.rs`, and the feature maps its slice to display state via an
+   inherent `apply(&self, &BatchedState) -> FeatureState` registered in
+   `features/mod.rs::apply_state`.
+2. Register one `Arc::new(...)` in `all_features()` under the right section.
+   Nothing else changes: the grid, picker gating, executor dispatch, and
+   error notifications are already generic over `FeatureKind` (`Toggle`,
+   `Stepper(StepperSpec)`, `Choice`, `Action`, `TextAction`).
+3. `Availability::EmulatorOnly` features: guard `perform` against physical
+   devices (check `serial` prefix or surface a clear error); the shell does
+   not gate availability yet.
 
 Rules that are easy to break:
 
 - Features never spawn processes and never run on the render thread — adb
-  calls happen only inside `FeatureExecutor` methods, which the app calls via
-  `background_spawn`.
-- `read_state` must tolerate missing/unknown output (OEM variance): degrade
-  to `FeatureState::None`/off, never panic.
+  calls happen only inside `Feature::perform` (dispatched via
+  `FeatureExecutor` on a background thread).
+- `apply` must tolerate missing/unknown output (OEM variance): degrade to
+  `FeatureState::None`/off, never panic.
 - Only `crates/adb-core` may spawn processes. The GUI crate depends on
   `adb-core` and on `gpui-kit = "=0.7.1"` only.
 

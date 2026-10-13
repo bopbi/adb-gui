@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::device::{Device, DeviceState, parse_devices};
+use crate::device::{Device, parse_devices};
 
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -45,21 +44,21 @@ fn run_watcher(adb_path: &PathBuf, tx: &mpsc::Sender<Vec<Device>>) -> Result<(),
         .map_err(|_| ())?;
 
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut devices: BTreeMap<String, DeviceState> = BTreeMap::new();
+    let mut reader = BufReader::new(stdout);
 
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break }; // EOF or read error: respawn
-        if !apply_line(&mut devices, &line) {
-            continue; // blank/unparseable: no change
-        }
-        let snapshot: Vec<Device> = devices
-            .iter()
-            .map(|(serial, state)| Device {
-                serial: serial.clone(),
-                state: *state,
-                model: None,
-            })
-            .collect();
+    loop {
+        // Every frame is the COMPLETE current device list: the payload of a
+        // frame replaces the snapshot wholesale, so a device absent from a
+        // frame is gone (AOSP SERVICES.TXT: track-devices sends a full
+        // device-list description, hex-length-framed, on every change).
+        let snapshot = match read_frame(&mut reader) {
+            Ok(Some(payload)) => parse_devices(&String::from_utf8_lossy(&payload)),
+            // EOF: adb exited. Probe the channel once so a dropped receiver
+            // ends the thread even when no further device changes arrive.
+            Ok(None) => return probe(tx),
+            // Malformed frame or read error: respawn adb.
+            Err(()) => return Ok(()),
+        };
         // Send failure means the receiver was dropped: kill adb and exit.
         if tx.send(snapshot).is_err() {
             let _ = child.kill();
@@ -67,78 +66,118 @@ fn run_watcher(adb_path: &PathBuf, tx: &mpsc::Sender<Vec<Device>>) -> Result<(),
             return Err(());
         }
     }
+}
 
-    // EOF: adb exited. Probe the channel once so a dropped receiver ends
-    // the thread even when no further device changes arrive.
-    if tx.send(snapshot_of(&devices)).is_err() {
+/// Post-EOF probe: report one (possibly empty) snapshot so a receiver that
+/// was dropped while adb idles still ends the watcher.
+fn probe(tx: &mpsc::Sender<Vec<Device>>) -> Result<(), ()> {
+    if tx.send(Vec::new()).is_err() {
         return Err(());
     }
     Ok(())
 }
 
-fn snapshot_of(devices: &BTreeMap<String, DeviceState>) -> Vec<Device> {
-    devices
-        .iter()
-        .map(|(serial, state)| Device {
-            serial: serial.clone(),
-            state: *state,
-            model: None,
-        })
-        .collect()
+enum FrameError {
+    /// Clean EOF before any frame byte.
+    Eof,
+    /// EOF mid-frame, a bad length prefix, or a read error.
+    Malformed,
 }
 
-/// Fold one `track-devices` line (`serial\tstate`) into the accumulated
-/// device map. Returns true when the map changed.
-///
-/// adb sends a full list on connect and one line per change afterwards, so
-/// upserting converges without frame boundaries. A device that vanishes is
-/// reported by adb with an `offline` line before removal from its own view,
-/// so the snapshot keeps the last known state until the watcher respawns.
-fn apply_line(devices: &mut BTreeMap<String, DeviceState>, line: &str) -> bool {
-    let mut parsed = parse_devices(line);
-    if parsed.len() != 1 {
-        return false;
+/// Read one hex-length-framed message: 4 ASCII hex chars giving the payload
+/// byte count, then exactly that many payload bytes. Returns Ok(None) on a
+/// clean EOF between frames.
+fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ()> {
+    match read_frame_inner(reader) {
+        Ok(payload) => Ok(Some(payload)),
+        Err(FrameError::Eof) => Ok(None),
+        Err(FrameError::Malformed) => Err(()),
     }
-    let device = parsed.remove(0);
-    match devices.get(&device.serial) {
-        Some(existing) if *existing == device.state => false,
-        _ => {
-            devices.insert(device.serial, device.state);
-            true
+}
+
+fn read_frame_inner(reader: &mut impl Read) -> Result<Vec<u8>, FrameError> {
+    let mut header = [0u8; 4];
+    read_up_to(reader, &mut header)?;
+    let length = std::str::from_utf8(&header)
+        .ok()
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .ok_or(FrameError::Malformed)? as usize;
+
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| FrameError::Malformed)?;
+    Ok(payload)
+}
+
+/// Read exactly `buf.len()` bytes; distinguish a clean EOF at the frame
+/// boundary (no bytes read) from EOF mid-frame.
+fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> Result<(), FrameError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) if filled == 0 => return Err(FrameError::Eof),
+            Ok(0) => return Err(FrameError::Malformed),
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(FrameError::Malformed),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DeviceState;
 
     #[test]
-    fn apply_line_upserts_and_reports_change() {
-        let mut map = BTreeMap::new();
-        assert!(apply_line(&mut map, "emulator-5554\tdevice"));
-        assert_eq!(map.get("emulator-5554"), Some(&DeviceState::Device));
+    fn read_frame_parses_hex_length_prefix() {
+        let mut stream: &[u8] = b"001632081FDH2000CY\tdevice\n";
+        let payload = read_frame(&mut stream).unwrap().expect("one frame");
+        assert_eq!(payload, b"32081FDH2000CY\tdevice\n");
+        // Stream fully consumed: next read is a clean EOF.
+        assert!(read_frame(&mut stream).unwrap().is_none());
+    }
 
-        // Same state again: no change reported.
-        assert!(!apply_line(&mut map, "emulator-5554\tdevice"));
+    #[test]
+    fn read_frame_handles_multi_device_and_empty_payloads() {
+        let payload = "32081FDH2000CY\tdevice\nemulator-5554\tdevice\n";
+        assert_eq!(payload.len(), 0x2B);
+        let framed = format!("{:04x}{payload}", payload.len());
+        let mut stream: &[u8] = framed.as_bytes();
+        let frame = read_frame(&mut stream).unwrap().expect("frame");
+        assert_eq!(frame, payload.as_bytes());
 
-        // State transition: change reported.
-        assert!(apply_line(&mut map, "emulator-5554\toffline"));
-        assert_eq!(map.get("emulator-5554"), Some(&DeviceState::Offline));
+        // Only the FIRST line of a frame carries the prefix; the others must
+        // stay glued to their own serials.
+        let parsed = parse_devices(&String::from_utf8_lossy(&frame));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].serial, "32081FDH2000CY");
+        assert_eq!(parsed[1].serial, "emulator-5554");
 
-        // Second device added.
-        assert!(apply_line(&mut map, "phone-1\tdevice"));
-        assert_eq!(map.len(), 2);
+        // A 0000 frame means "no devices" and must parse as an empty list.
+        let mut stream: &[u8] = b"0000";
+        let frame = read_frame(&mut stream).unwrap().expect("frame");
+        assert!(parse_devices(&String::from_utf8_lossy(&frame)).is_empty());
+    }
 
-        // Garbage lines ignored.
-        assert!(!apply_line(&mut map, ""));
-        assert!(!apply_line(&mut map, "nonsense words here"));
-        assert_eq!(map.len(), 2);
+    #[test]
+    fn read_frame_rejects_malformed_streams() {
+        // Non-hex length prefix.
+        let mut stream: &[u8] = b"zz16payload";
+        assert!(read_frame(&mut stream).is_err());
+        // Truncated payload.
+        let mut stream: &[u8] = b"0016abc";
+        assert!(read_frame(&mut stream).is_err());
+        // Truncated header mid-frame is malformed, not clean EOF.
+        let mut stream: &[u8] = b"00";
+        assert!(read_frame(&mut stream).is_err());
     }
 
     // The watcher tests drive a fake adb shell script; they are Unix-only
-    // (matching client.rs's `#[cfg(all(test, unix))]`). The pure `apply_line`
-    // test above stays cross-platform.
+    // (matching client.rs's `#[cfg(all(test, unix))]`). The pure frame tests
+    // above stay cross-platform.
     #[cfg(unix)]
     mod watcher {
         use super::*;
@@ -157,41 +196,22 @@ mod tests {
             path
         }
 
-        #[test]
-        fn watcher_streams_snapshots_and_exits_when_receiver_drops() {
-            // The fake adb prints an initial list, then one state change, then
-            // exits; the watcher must stream both snapshots and end the thread
-            // when the receiver is dropped (detected at the post-EOF probe).
-            let adb = script(
-                "fake-track-devices",
-                r#"printf 'emulator-5554\tdevice\nphone-1\tdevice\n'
-sleep 0.2
-printf 'phone-1\toffline\n'
-exit 0"#,
-            );
-
-            let (handle, rx) = spawn_device_watcher(adb);
-
-            // adb sends one line per change, so snapshots arrive incrementally;
-            // wait until the offline transition lands.
-            let mut saw_full_list = false;
-            let mut saw_offline = false;
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !saw_offline {
+        /// Wait for snapshots until `predicate` holds or the deadline passes.
+        fn collect_until(
+            rx: &Receiver<Vec<Device>>,
+            deadline: std::time::Instant,
+            mut predicate: impl FnMut(&[Device]) -> bool,
+        ) -> Vec<Device> {
+            loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let snapshot = rx.recv_timeout(remaining).expect("snapshot timed out");
-                if snapshot.len() == 2 {
-                    saw_full_list = true;
-                }
-                if let Some(phone) = snapshot.iter().find(|d| d.serial == "phone-1")
-                    && phone.state == DeviceState::Offline
-                {
-                    saw_offline = true;
+                if predicate(&snapshot) {
+                    return snapshot;
                 }
             }
-            assert!(saw_full_list, "never saw the two-device snapshot");
-            assert!(saw_offline, "never saw the offline transition");
+        }
 
+        fn exit_after_receiver_drop(handle: JoinHandle<()>, rx: Receiver<Vec<Device>>) {
             drop(rx); // receiver gone: watcher must exit at the next send
             let (done_tx, done_rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -204,6 +224,100 @@ exit 0"#,
         }
 
         #[test]
+        fn watcher_streams_framed_snapshots_with_clean_serials() {
+            // Real track-devices framing: 4 hex chars + payload, where the
+            // payload is the complete device list. The first frame lists two
+            // devices; the second frame lists them again with one offline.
+            // Regression: parsed serials must never contain the hex prefix.
+            let adb = script(
+                "fake-track-framed",
+                r#"printf '002B'; printf '32081FDH2000CY\tdevice\nemulator-5554\tdevice\n'
+sleep 0.2
+printf '002C'; printf '32081FDH2000CY\tdevice\nemulator-5554\toffline\n'
+exit 0"#,
+            );
+
+            let (handle, rx) = spawn_device_watcher(adb);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            let first = collect_until(&rx, deadline, |snapshot| snapshot.len() == 2);
+            assert_eq!(first.len(), 2);
+            assert!(
+                first
+                    .iter()
+                    .any(|d| d.serial == "32081FDH2000CY" && d.state == DeviceState::Device),
+                "physical device must appear with its clean serial, got {first:?}"
+            );
+            assert!(
+                first
+                    .iter()
+                    .all(|d| !d.serial.starts_with("0016") && !d.serial.starts_with("002B")),
+                "no serial may carry the frame's hex prefix"
+            );
+
+            let second = collect_until(&rx, deadline, |snapshot| {
+                snapshot
+                    .iter()
+                    .any(|d| d.serial == "emulator-5554" && d.state == DeviceState::Offline)
+            });
+            assert_eq!(second.len(), 2, "a frame is the complete list");
+            assert!(
+                second.iter().all(|d| !d.serial.starts_with("002C")),
+                "later frames must not leak their prefix either"
+            );
+
+            exit_after_receiver_drop(handle, rx);
+        }
+
+        #[test]
+        fn watcher_replaces_snapshot_across_frames() {
+            // Frame 1 lists two devices; frame 2 drops phone-1 entirely.
+            // Replacement semantics: the absent device must vanish from the
+            // snapshot (no upsert of stale entries).
+            let adb = script(
+                "fake-track-removal",
+                r#"printf '002B'; printf '32081FDH2000CY\tdevice\nemulator-5554\tdevice\n'
+sleep 0.2
+printf '0015'; printf 'emulator-5554\tdevice\n'
+exit 0"#,
+            );
+
+            let (handle, rx) = spawn_device_watcher(adb);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            let first = collect_until(&rx, deadline, |snapshot| snapshot.len() == 2);
+            assert!(first.iter().any(|d| d.serial == "32081FDH2000CY"));
+
+            let second = collect_until(&rx, deadline, |snapshot| {
+                snapshot.len() == 1 && snapshot[0].serial == "emulator-5554"
+            });
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].state, DeviceState::Device);
+
+            exit_after_receiver_drop(handle, rx);
+        }
+
+        #[test]
+        fn watcher_streams_empty_frame_when_all_devices_disconnect() {
+            let adb = script(
+                "fake-track-empty",
+                r#"printf '0016'; printf '32081FDH2000CY\tdevice\n'
+sleep 0.2
+printf '0000'
+exit 0"#,
+            );
+
+            let (handle, rx) = spawn_device_watcher(adb);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            collect_until(&rx, deadline, |snapshot| snapshot.len() == 1);
+            let empty = collect_until(&rx, deadline, |snapshot| snapshot.is_empty());
+            assert!(empty.is_empty());
+
+            exit_after_receiver_drop(handle, rx);
+        }
+
+        #[test]
         fn watcher_respawns_dead_adb() {
             let counter =
                 std::env::temp_dir().join(format!("adb-gui-track-counter-{}", std::process::id()));
@@ -211,7 +325,7 @@ exit 0"#,
             let adb = script(
                 "fake-track-respawn",
                 r#"echo x >> "$ADB_GUI_TRACK_COUNTER"
-printf 'emulator-5554\tdevice\n'
+printf '0015'; printf 'emulator-5554\tdevice\n'
 exit 0"#,
             );
             // Safety: read only by the fake adb spawned by this test.
@@ -234,17 +348,9 @@ exit 0"#,
                 "adb was respawned only {invocations} time(s)"
             );
 
-            drop(rx);
-            let (done_tx, done_rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = done_tx.send(handle.join());
-            });
-            done_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("watcher did not exit")
-                .expect("watcher panicked");
             unsafe { std::env::remove_var("ADB_GUI_TRACK_COUNTER") };
             let _ = fs::remove_file(&counter);
+            exit_after_receiver_drop(handle, rx);
         }
     }
 }

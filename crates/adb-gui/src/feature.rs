@@ -3,16 +3,64 @@ use std::sync::Arc;
 use adb_core::{AdbClient, AdbError};
 
 /// The control a feature renders as in the grid — the direct port of
-/// oh-my-android's FeatureKind.
+/// oh-my-android's FeatureKind. The GUI renders only from this data; no
+/// feature-specific knowledge may leak into the view.
 pub enum FeatureKind {
     Toggle,
-    Stepper,
+    Stepper(StepperSpec),
     Choice(Vec<ChoiceOption>),
     Action,
     TextAction,
 }
 
+/// How a stepper cell steps: fixed presets (font scale) or relative down/up
+/// steps with an optional reset (display size, later battery).
+pub enum StepperSpec {
+    Presets(&'static [&'static str]),
+    Relative { supports_reset: bool },
+}
+
+impl StepperSpec {
+    /// The inputs the −/+ buttons dispatch for the current value. Preset
+    /// steppers move to the adjacent preset; relative steppers use
+    /// `Index(0)` = down, `Index(1)` = up.
+    pub fn step_inputs(&self, current: Option<&str>) -> (FeatureInput, FeatureInput) {
+        match self {
+            StepperSpec::Presets(presets) => {
+                let current_ix = current
+                    .and_then(|value| nearest_index(presets, value))
+                    .unwrap_or(0);
+                (
+                    FeatureInput::Index(current_ix.saturating_sub(1)),
+                    FeatureInput::Index((current_ix + 1).min(presets.len() - 1)),
+                )
+            }
+            StepperSpec::Relative { .. } => (FeatureInput::Index(0), FeatureInput::Index(1)),
+        }
+    }
+}
+
+/// The preset a device value belongs to: exact match, else the nearest by
+/// numeric distance (devices report off-preset values like "1.05"). None
+/// when the value is unparseable.
+pub(crate) fn nearest_index(presets: &[&str], value: &str) -> Option<usize> {
+    let parsed: f32 = value.parse().ok()?;
+    if let Some(ix) = presets.iter().position(|preset| *preset == value) {
+        return Some(ix);
+    }
+    presets
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = (parsed - a.parse::<f32>().unwrap()).abs();
+            let db = (parsed - b.parse::<f32>().unwrap()).abs();
+            da.total_cmp(&db)
+        })
+        .map(|(ix, _)| ix)
+}
+
 /// One selectable option of a [`FeatureKind::Choice`] feature.
+#[derive(Clone)]
 pub struct ChoiceOption {
     pub id: &'static str,
     pub label: &'static str,
@@ -33,16 +81,20 @@ pub enum FeatureState {
 }
 
 /// The user intent a feature is asked to apply.
+#[derive(Clone, PartialEq)]
 pub enum FeatureInput {
     None,
     Bool(bool),
     Index(usize),
     Text(String),
+    /// Step back to the device's default (relative steppers with reset).
+    Reset,
 }
 
 /// One device capability: declares what it is and the adb commands it needs.
-/// The GUI renders from [`Feature::kind`] and runs [`Feature::perform`] /
-/// [`Feature::read_state`] on a background thread through `AdbClient`.
+/// The GUI renders from [`Feature::kind`] and runs [`Feature::perform`] on a
+/// background thread through `AdbClient`; reads join the shared batch in
+/// `features::state_reader` and map through `apply` in `features::mod`.
 pub trait Feature: Send + Sync {
     fn id(&self) -> &'static str;
     fn title(&self) -> &'static str;
@@ -53,7 +105,6 @@ pub trait Feature: Send + Sync {
     fn is_destructive(&self) -> bool {
         false
     }
-    fn read_state(&self, client: &AdbClient, serial: &str) -> Result<FeatureState, AdbError>;
     fn perform(
         &self,
         client: &AdbClient,
@@ -62,64 +113,55 @@ pub trait Feature: Send + Sync {
     ) -> Result<(), AdbError>;
 }
 
+/// One section of the catalog: a titled group of consecutive features in the
+/// registry, mirroring oh-my-android's sectioned feature list.
+pub struct Section {
+    pub title: &'static str,
+    pub start: usize,
+    pub len: usize,
+}
+
 /// The registry of all features, mirroring oh-my-android's FeatureCatalog.
 pub struct FeatureRegistry {
     features: Vec<Arc<dyn Feature>>,
+    sections: Vec<Section>,
 }
 
 impl FeatureRegistry {
     pub fn new(features: Vec<Arc<dyn Feature>>) -> Self {
-        Self { features }
+        let len = features.len();
+        Self {
+            features,
+            sections: vec![Section {
+                title: "",
+                start: 0,
+                len,
+            }],
+        }
+    }
+
+    /// Build a registry from titled groups; the flat feature order is the
+    /// concatenation of the groups, and [`Self::sections`] records where each
+    /// group lives so the grid can render headers.
+    pub fn with_sections(groups: Vec<(&'static str, Vec<Arc<dyn Feature>>)>) -> Self {
+        let mut features = Vec::new();
+        let mut sections = Vec::new();
+        for (title, group) in groups {
+            sections.push(Section {
+                title,
+                start: features.len(),
+                len: group.len(),
+            });
+            features.extend(group);
+        }
+        Self { features, sections }
     }
 
     pub fn features(&self) -> &[Arc<dyn Feature>] {
         &self.features
     }
-}
 
-/// The catalog. Parts 04–06 register the real feature set here.
-pub fn all_features() -> FeatureRegistry {
-    FeatureRegistry::new(vec![Arc::new(SampleDarkModeToggle)])
-}
-
-/// Proving ground for the Feature pattern; hardened in part 04.
-///
-/// `settings get/put secure ui_night_mode`: `1` = no, `2` = yes.
-pub struct SampleDarkModeToggle;
-
-impl Feature for SampleDarkModeToggle {
-    fn id(&self) -> &'static str {
-        "appearance.dark-mode"
-    }
-
-    fn title(&self) -> &'static str {
-        "Dark mode"
-    }
-
-    fn kind(&self) -> FeatureKind {
-        FeatureKind::Toggle
-    }
-
-    fn read_state(&self, client: &AdbClient, serial: &str) -> Result<FeatureState, AdbError> {
-        let output = client.shell(serial, &["settings", "get", "secure", "ui_night_mode"])?;
-        // Values other than 1/2 (0, null, empty) mean auto/unknown: show off.
-        Ok(FeatureState::Toggle(output.trim() == "2"))
-    }
-
-    fn perform(
-        &self,
-        client: &AdbClient,
-        serial: &str,
-        input: FeatureInput,
-    ) -> Result<(), AdbError> {
-        let FeatureInput::Bool(on) = input else {
-            return Ok(());
-        };
-        let value: &str = if on { "2" } else { "1" };
-        client.shell(
-            serial,
-            &["settings", "put", "secure", "ui_night_mode", value],
-        )?;
-        Ok(())
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
     }
 }

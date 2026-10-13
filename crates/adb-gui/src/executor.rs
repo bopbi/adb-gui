@@ -3,50 +3,55 @@ use std::sync::Arc;
 use adb_core::{AdbClient, AdbError};
 
 use crate::feature::{Feature, FeatureInput, FeatureState};
+use crate::features::{apply_state, state_reader};
 
 /// Runs feature commands against a device. The GUI dispatches these on GPUI's
 /// background executor (see `AppView::dispatch`), so implementations may block
 /// on adb; the render thread never does. The single seam UI tests stub out.
 pub trait FeatureExecutor: Send + Sync {
-    /// Apply `input`, then read the resulting state so the cell can refresh.
-    fn perform_and_read(
+    /// Apply `input` to the feature.
+    fn perform(
         &self,
         client: AdbClient,
         feature: Arc<dyn Feature>,
         serial: String,
         input: FeatureInput,
-    ) -> Result<FeatureState, AdbError>;
+    ) -> Result<(), AdbError>;
 
-    /// Read the current state without performing anything (initial load).
-    fn read(
+    /// Read the current state of every feature in ONE batched device round
+    /// trip (initial load, and re-read after a successful `perform`).
+    fn read_all(
         &self,
         client: AdbClient,
-        feature: Arc<dyn Feature>,
+        features: Vec<Arc<dyn Feature>>,
         serial: String,
-    ) -> Result<FeatureState, AdbError>;
+    ) -> Result<Vec<FeatureState>, AdbError>;
 }
 
 /// The production executor: feature-declared adb commands through `AdbClient`.
 pub struct AdbExecutor;
 
 impl FeatureExecutor for AdbExecutor {
-    fn perform_and_read(
+    fn perform(
         &self,
         client: AdbClient,
         feature: Arc<dyn Feature>,
         serial: String,
         input: FeatureInput,
-    ) -> Result<FeatureState, AdbError> {
-        feature.perform(&client, &serial, input)?;
-        feature.read_state(&client, &serial)
+    ) -> Result<(), AdbError> {
+        feature.perform(&client, &serial, input)
     }
 
-    fn read(
+    fn read_all(
         &self,
         client: AdbClient,
-        feature: Arc<dyn Feature>,
+        features: Vec<Arc<dyn Feature>>,
         serial: String,
-    ) -> Result<FeatureState, AdbError> {
-        feature.read_state(&client, &serial)
+    ) -> Result<Vec<FeatureState>, AdbError> {
+        let state = state_reader::read(&client, &serial)?;
+        Ok(features
+            .iter()
+            .map(|feature| apply_state(feature.as_ref(), &state))
+            .collect())
     }
 }

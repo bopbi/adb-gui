@@ -8,11 +8,13 @@ mod app;
 mod device_store;
 mod executor;
 mod feature;
+mod features;
 
 pub use app::AppView;
 pub use device_store::{DeviceStore, DeviceStoreEvent};
 pub use executor::{AdbExecutor, FeatureExecutor};
 pub use feature::{
     Availability, ChoiceOption, Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState,
-    SampleDarkModeToggle, all_features,
+    Section, StepperSpec,
 };
+pub use features::all_features;

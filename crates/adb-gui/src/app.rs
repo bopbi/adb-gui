@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::searchable_list::SearchableListItem;
@@ -24,7 +25,30 @@ use adb_core::{AdbClient, Device, DeviceState, find_adb};
 
 use crate::device_store::DeviceStore;
 use crate::executor::{AdbExecutor, FeatureExecutor};
-use crate::feature::{FeatureInput, FeatureKind, FeatureRegistry, FeatureState, all_features};
+use crate::feature::{
+    Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState, StepperSpec,
+};
+use crate::features::all_features;
+
+/// One option of a feature's `Choice` cell, as shown in its per-cell
+/// dropdown. The value is the option's index in the feature's option list.
+#[derive(Clone, PartialEq)]
+struct ChoiceItem {
+    label: SharedString,
+    index: usize,
+}
+
+impl SearchableListItem for ChoiceItem {
+    type Value = usize;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.index
+    }
+}
 
 /// A device as shown in the picker: "model · serial", with the state appended
 /// for rows that are not usable. Unusable rows render disabled.
@@ -73,18 +97,66 @@ struct FeatureCell {
     state: FeatureState,
     busy: bool,
     error: Option<String>,
+    /// The text input backing a `FeatureKind::TextAction` cell (Enter
+    /// submits its content).
+    input: Option<Entity<InputState>>,
+    /// The dropdown backing a `FeatureKind::Choice` cell. Selecting an
+    /// option dispatches `FeatureInput::Index` — intermediate values are
+    /// never applied.
+    choice: Option<Entity<SelectState<Vec<ChoiceItem>>>>,
+    /// Keeps the choice cell's Confirm subscription alive.
+    _choice_subscription: Option<Subscription>,
 }
 
 impl FeatureCell {
-    fn new(kind: &FeatureKind) -> Self {
+    fn new(
+        ix: usize,
+        feature: &dyn Feature,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) -> Self {
+        let kind = feature.kind();
         let state = match kind {
             FeatureKind::Toggle => FeatureState::Toggle(false),
             _ => FeatureState::None,
+        };
+        let input = match kind {
+            FeatureKind::TextAction => Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Text to type, then press Enter")
+            })),
+            _ => None,
+        };
+        let (choice, choice_subscription) = match kind {
+            FeatureKind::Choice(options) => {
+                let items: Vec<ChoiceItem> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| ChoiceItem {
+                        label: option.label.into(),
+                        index,
+                    })
+                    .collect();
+                let choice = cx.new(|cx| SelectState::new(items, None, window, cx));
+                let subscription = cx.subscribe_in(
+                    &choice,
+                    window,
+                    move |this, _choice, event: &SelectEvent<Vec<ChoiceItem>>, window, cx| {
+                        if let SelectEvent::Confirm(Some(index)) = event {
+                            this.on_feature_input(ix, FeatureInput::Index(*index), window, cx);
+                        }
+                    },
+                );
+                (Some(choice), Some(subscription))
+            }
+            _ => (None, None),
         };
         Self {
             state,
             busy: false,
             error: None,
+            input,
+            choice,
+            _choice_subscription: choice_subscription,
         }
     }
 }
@@ -181,11 +253,26 @@ impl AppView {
             },
         );
 
-        let cells = registry
-            .features()
-            .iter()
-            .map(|feature| FeatureCell::new(&feature.kind()))
-            .collect();
+        let mut cells = Vec::with_capacity(registry.features().len());
+        let mut subscriptions = vec![store_subscription, picker_subscription];
+        for (ix, feature) in registry.features().iter().enumerate() {
+            cells.push(FeatureCell::new(ix, feature.as_ref(), window, cx));
+            // Enter in a text-action cell submits its content to the feature.
+            if let Some(input) = cells[ix].input.clone() {
+                subscriptions.push(cx.subscribe_in(
+                    &input,
+                    window,
+                    move |this, input, event: &InputEvent, window, cx| {
+                        if let InputEvent::PressEnter { .. } = event {
+                            let text = input.read(cx).value().to_string();
+                            if !text.is_empty() {
+                                this.dispatch(ix, FeatureInput::Text(text), window, cx);
+                            }
+                        }
+                    },
+                ));
+            }
+        }
 
         let mut this = Self {
             client,
@@ -197,7 +284,7 @@ impl AppView {
             devices,
             selected_serial,
             startup_error,
-            _subscriptions: vec![store_subscription, picker_subscription],
+            _subscriptions: subscriptions,
         };
         // The store may already hold a selection (pre-populated store, or a
         // snapshot that landed between its creation and our subscription):
@@ -248,35 +335,61 @@ impl AppView {
         cx.notify();
     }
 
-    /// Read every feature's initial state for the newly selected device.
-    /// Errors are ignored here (the perform path surfaces them).
+    /// Read every feature's state for the selected device in ONE batched
+    /// device round trip. Errors are ignored here (the perform path surfaces
+    /// them).
     fn refresh_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(serial) = self.selected_serial.clone() else {
             return;
         };
-        for ix in 0..self.registry.features().len() {
-            let feature = self.registry.features()[ix].clone();
-            let executor = self.executor.clone();
-            let client = self.client.clone();
-            let serial = serial.clone();
-            self.cells[ix].busy = true;
-            cx.spawn_in(window, async move |this, cx| {
-                let result = cx
-                    .background_spawn(async move { executor.read(client, feature, serial) })
-                    .await;
-                this.update_in(cx, |this, _window, cx| {
-                    this.cells[ix].busy = false;
-                    if let Ok(state) = result {
-                        this.cells[ix].state = state;
-                        this.cells[ix].error = None;
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+        let features: Vec<_> = self.registry.features().to_vec();
+        let executor = self.executor.clone();
+        let client = self.client.clone();
+        for cell in &mut self.cells {
+            cell.busy = true;
         }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { executor.read_all(client, features, serial) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                for cell in &mut this.cells {
+                    cell.busy = false;
+                }
+                if let Ok(states) = result {
+                    for (cell, state) in this.cells.iter_mut().zip(states) {
+                        cell.state = state;
+                        cell.error = None;
+                    }
+                    this.sync_choice_selections(window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// Mirror each choice cell's batched state into its dropdown so the
+    /// select shows the device's current option.
+    fn sync_choice_selections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for ix in 0..self.cells.len() {
+            let (Some(choice), FeatureKind::Choice(options)) = (
+                self.cells[ix].choice.clone(),
+                &self.registry.features()[ix].kind(),
+            ) else {
+                continue;
+            };
+            let selected = match &self.cells[ix].state {
+                FeatureState::Value(tag) => options.iter().position(|opt| opt.id == *tag),
+                _ => None,
+            };
+            choice.update(cx, |state, cx| match selected {
+                Some(row) => state.set_selected_value(&row, window, cx),
+                None => state.set_selected_index(None, window, cx),
+            });
+        }
     }
 
     fn on_feature_input(
@@ -316,7 +429,8 @@ impl AppView {
         }
     }
 
-    /// Run the feature command on a background thread and refresh the cell.
+    /// Run the feature command on a background thread, then re-read every
+    /// feature's state in one batched round trip so all cells refresh.
     fn dispatch(
         &mut self,
         ix: usize,
@@ -328,6 +442,7 @@ impl AppView {
             return;
         };
         let feature = self.registry.features()[ix].clone();
+        let features: Vec<_> = self.registry.features().to_vec();
         let executor = self.executor.clone();
         let client = self.client.clone();
         let feature_id = feature.id();
@@ -336,16 +451,31 @@ impl AppView {
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
-                .background_spawn(async move {
-                    executor.perform_and_read(client, feature, serial, input)
+                .background_spawn({
+                    let executor = executor.clone();
+                    let client = client.clone();
+                    let serial = serial.clone();
+                    async move { executor.perform(client, feature, serial, input) }
                 })
                 .await;
+            // Re-read batched state after a successful perform so every cell
+            // reflects the device; a failed perform keeps the old state.
+            let states: Result<Vec<FeatureState>, adb_core::AdbError> = match result {
+                Ok(()) => {
+                    cx.background_spawn(async move { executor.read_all(client, features, serial) })
+                        .await
+                }
+                Err(err) => Err(err),
+            };
             this.update_in(cx, |this, window, cx| {
                 this.cells[ix].busy = false;
-                match result {
-                    Ok(state) => {
-                        this.cells[ix].state = state;
-                        this.cells[ix].error = None;
+                match states {
+                    Ok(states) => {
+                        for (cell, state) in this.cells.iter_mut().zip(states) {
+                            cell.state = state;
+                            cell.error = None;
+                        }
+                        this.sync_choice_selections(window, cx);
                     }
                     Err(err) => {
                         this.cells[ix].error = Some(err.to_string());
@@ -413,18 +543,31 @@ impl AppView {
     }
 
     fn render_grid(&self, grid_enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let mut grid = div()
             .id("feature-grid")
             .test_support()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .child(div().flex().flex_wrap().gap_3().children(
-                (0..self.registry.features().len()).map(|ix| {
+            .v_flex()
+            .gap_4();
+        for section in self.registry.sections() {
+            if section.len == 0 {
+                continue;
+            }
+            let mut group = v_flex().gap_2();
+            if !section.title.is_empty() {
+                group =
+                    group.child(Label::new(section.title).text_color(cx.theme().muted_foreground));
+            }
+            grid = grid.child(group.child(div().flex().flex_wrap().gap_3().children(
+                (section.start..section.start + section.len).map(|ix| {
                     self.render_feature_cell(ix, grid_enabled, cx)
                         .into_any_element()
                 }),
-            ))
+            )));
+        }
+        grid
     }
 
     fn render_feature_cell(
@@ -448,6 +591,77 @@ impl AppView {
                     }))
                     .into_any_element()
             }
+            FeatureKind::Stepper(spec) => {
+                let current = match &cell.state {
+                    FeatureState::Value(value) => Some(value.as_str()),
+                    _ => None,
+                };
+                let (minus_input, plus_input) = spec.step_inputs(current);
+                // Four controls do not fit one 144px cell row; the stepper is
+                // two rows: − value +, then the optional reset.
+                let mut control = v_flex().gap_1().child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Button::new(format!("feature-stepper-minus:{}", feature.id()))
+                                .label("−")
+                                .compact()
+                                .disabled(!enabled)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.on_feature_input(ix, minus_input.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(format!("feature-stepper-value:{}", feature.id()))
+                                .test_support()
+                                .flex_1()
+                                .justify_center()
+                                .child(Label::new(current.unwrap_or("Default"))),
+                        )
+                        .child(
+                            Button::new(format!("feature-stepper-plus:{}", feature.id()))
+                                .label("+")
+                                .compact()
+                                .disabled(!enabled)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.on_feature_input(ix, plus_input.clone(), window, cx);
+                                })),
+                        ),
+                );
+                if let StepperSpec::Relative {
+                    supports_reset: true,
+                } = spec
+                {
+                    control = control.child(
+                        h_flex().justify_end().child(
+                            Button::new(format!("feature-stepper-reset:{}", feature.id()))
+                                .label("Reset")
+                                .compact()
+                                .disabled(!enabled)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.on_feature_input(ix, FeatureInput::Reset, window, cx);
+                                })),
+                        ),
+                    );
+                }
+                control.into_any_element()
+            }
+            FeatureKind::Choice(_) => {
+                // A real dropdown: selecting an option applies exactly that
+                // option — cycling through intermediates is gone (G3).
+                let choice = cell
+                    .choice
+                    .as_ref()
+                    .expect("choice cells are created with a select");
+                Select::new(choice)
+                    .id(format!("feature-choice:{}", feature.id()))
+                    .placeholder("Select…")
+                    .w_full()
+                    .disabled(!enabled)
+                    .into_any_element()
+            }
             FeatureKind::Action => Button::new(format!("feature-action:{}", feature.id()))
                 .label(feature.title())
                 .disabled(!enabled)
@@ -456,12 +670,16 @@ impl AppView {
                     this.on_feature_input(ix, FeatureInput::None, window, cx);
                 }))
                 .into_any_element(),
-            // The shell ships one Toggle; other kinds render as disabled
-            // placeholders until their features land in parts 04–06.
-            _ => Button::new(format!("feature-unavailable:{}", feature.id()))
-                .label(feature.title())
-                .disabled(true)
-                .into_any_element(),
+            FeatureKind::TextAction => {
+                let input = cell
+                    .input
+                    .as_ref()
+                    .expect("text-action cells are created with an input");
+                Input::new(input)
+                    .id(format!("feature-input:{}", feature.id()))
+                    .disabled(!enabled)
+                    .into_any_element()
+            }
         };
 
         div()
