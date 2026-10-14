@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -16,9 +17,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TestSupportExt, Window, div, rems,
+    AnyElement, AppContext as _, ClipboardItem, Context, Entity, ExternalPaths, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt, Window, div, rems,
 };
 
 use adb_core::{AdbClient, Device, DeviceState, find_adb};
@@ -26,9 +27,11 @@ use adb_core::{AdbClient, Device, DeviceState, find_adb};
 use crate::device_store::DeviceStore;
 use crate::executor::{AdbExecutor, FeatureExecutor};
 use crate::feature::{
-    Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState, StepperSpec,
+    ClipboardPayload, Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState,
+    StepperSpec,
 };
 use crate::features::all_features;
+use crate::features::install_apk::INSTALL_APK_ID;
 
 /// One option of a feature's `Choice` cell, as shown in its per-cell
 /// dropdown. The value is the option's index in the feature's option list.
@@ -442,6 +445,8 @@ impl AppView {
             return;
         };
         let feature = self.registry.features()[ix].clone();
+        // Kept for the post-perform clipboard pickup (screenshots).
+        let clipboard_feature = feature.clone();
         let features: Vec<_> = self.registry.features().to_vec();
         let executor = self.executor.clone();
         let client = self.client.clone();
@@ -460,6 +465,8 @@ impl AppView {
                 .await;
             // Re-read batched state after a successful perform so every cell
             // reflects the device; a failed perform keeps the old state.
+            // The perform itself succeeded or not regardless of this re-read.
+            let performed = result.is_ok();
             let states: Result<Vec<FeatureState>, adb_core::AdbError> = match result {
                 Ok(()) => {
                     cx.background_spawn(async move { executor.read_all(client, features, serial) })
@@ -469,6 +476,17 @@ impl AppView {
             };
             this.update_in(cx, |this, window, cx| {
                 this.cells[ix].busy = false;
+                // Post-perform offers depend only on the perform succeeding:
+                // a screenshot must reach the clipboard even if the re-read
+                // fails, and a fallback-path note must surface either way.
+                if performed {
+                    if let Some(payload) = clipboard_feature.clipboard_payload() {
+                        Self::offer_clipboard(payload, cx);
+                    }
+                    if let Some(notice) = clipboard_feature.notice() {
+                        window.push_notification(Notification::info(notice), cx);
+                    }
+                }
                 match states {
                     Ok(states) => {
                         for (cell, state) in this.cells.iter_mut().zip(states) {
@@ -490,6 +508,20 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+
+    /// Place a feature's post-perform payload (a screenshot PNG) on the
+    /// system clipboard.
+    fn offer_clipboard(payload: ClipboardPayload, cx: &mut gpui_kit::App) {
+        if payload.format == "png" {
+            static IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+            let image = Image {
+                format: ImageFormat::Png,
+                bytes: payload.bytes,
+                id: IMAGE_ID.fetch_add(1, Ordering::Relaxed),
+            };
+            cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        }
     }
 
     fn render_device_picker(&self) -> impl IntoElement {
@@ -707,6 +739,23 @@ impl Render for AppView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            // Dropping an .apk anywhere on the window installs it.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                let Some(ix) = this
+                    .registry
+                    .features()
+                    .iter()
+                    .position(|feature| feature.id() == INSTALL_APK_ID)
+                else {
+                    return;
+                };
+                for path in paths.paths() {
+                    let text = path.to_string_lossy().into_owned();
+                    if text.to_ascii_lowercase().ends_with(".apk") {
+                        this.dispatch(ix, FeatureInput::Text(text), window, cx);
+                    }
+                }
+            }))
             .child(TitleBar::new().child(Label::new("adb-gui")))
             .child(
                 v_flex()

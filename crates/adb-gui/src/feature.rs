@@ -91,6 +91,16 @@ pub enum FeatureInput {
     Reset,
 }
 
+/// Bytes the app should place on the system clipboard after a successful
+/// [`Feature::perform`] (e.g. a screenshot PNG). The clipboard lives in the
+/// app layer, so features hand the payload over instead of touching it
+/// themselves.
+pub struct ClipboardPayload {
+    /// Image format tag; `"png"` is the only supported value today.
+    pub format: &'static str,
+    pub bytes: Vec<u8>,
+}
+
 /// One device capability: declares what it is and the adb commands it needs.
 /// The GUI renders from [`Feature::kind`] and runs [`Feature::perform`] on a
 /// background thread through `AdbClient`; reads join the shared batch in
@@ -104,6 +114,17 @@ pub trait Feature: Send + Sync {
     }
     fn is_destructive(&self) -> bool {
         false
+    }
+    /// Payload to offer the system clipboard after a successful `perform`
+    /// (screenshots). Default: nothing.
+    fn clipboard_payload(&self) -> Option<ClipboardPayload> {
+        None
+    }
+    /// A user-facing note stashed by the last `perform` (e.g. where a capture
+    /// landed when the Pictures dir was unavailable). The app shows it as a
+    /// notification after a successful perform. Default: nothing.
+    fn notice(&self) -> Option<String> {
+        None
     }
     fn perform(
         &self,

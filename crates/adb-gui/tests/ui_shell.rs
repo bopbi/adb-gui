@@ -39,10 +39,15 @@ enum InputSummary {
 }
 
 /// The seam UI tests stub out: records calls, reflects Bool performs back in
-/// its batched read, never touches a device.
+/// its batched read, never touches a device. `delegate_perform` runs the real
+/// feature's perform (against a fake adb) so cross-layer behavior like the
+/// screenshot clipboard is exercised; `fail_read_all` injects a re-read
+/// failure (K3: post-perform offers must not depend on the re-read).
 struct RecordingExecutor {
     calls: Mutex<Vec<RecordedCall>>,
     dark_mode_on: Mutex<bool>,
+    delegate_perform: Mutex<bool>,
+    fail_read_all: Mutex<bool>,
 }
 
 impl RecordingExecutor {
@@ -50,11 +55,21 @@ impl RecordingExecutor {
         Self {
             calls: Mutex::new(Vec::new()),
             dark_mode_on: Mutex::new(false),
+            delegate_perform: Mutex::new(false),
+            fail_read_all: Mutex::new(false),
         }
     }
 
     fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn set_delegate_perform(&self, on: bool) {
+        *self.delegate_perform.lock().unwrap() = on;
+    }
+
+    fn set_fail_read_all(&self, on: bool) {
+        *self.fail_read_all.lock().unwrap() = on;
     }
 }
 
@@ -78,9 +93,12 @@ impl FeatureExecutor for RecordingExecutor {
         };
         self.calls.lock().unwrap().push(RecordedCall::Perform {
             feature_id: feature.id(),
-            serial,
+            serial: serial.clone(),
             input: summary,
         });
+        if *self.delegate_perform.lock().unwrap() {
+            return feature.perform(&_client, &serial, input);
+        }
         Ok(())
     }
 
@@ -94,6 +112,12 @@ impl FeatureExecutor for RecordingExecutor {
             .lock()
             .unwrap()
             .push(RecordedCall::ReadAll { serial });
+        if *self.fail_read_all.lock().unwrap() {
+            return Err(adb_core::AdbError::CommandFailed {
+                command: "batched read".to_string(),
+                stderr: "injected re-read failure".to_string(),
+            });
+        }
         let dark_mode_on = *self.dark_mode_on.lock().unwrap();
         Ok(features
             .iter()
@@ -129,6 +153,17 @@ fn open_app(
     devices: Vec<Device>,
     executor: Arc<RecordingExecutor>,
 ) -> AnyWindowHandle {
+    open_app_with_client(cx, devices, executor, AdbClient::new(PathBuf::from("adb")))
+}
+
+/// Like [`open_app`] with an explicit adb client — tests that delegate
+/// performs to real features against a fake adb use this.
+fn open_app_with_client(
+    cx: &mut TestAppContext,
+    devices: Vec<Device>,
+    executor: Arc<RecordingExecutor>,
+    client: AdbClient,
+) -> AnyWindowHandle {
     cx.update(gpui_kit::init);
     cx.update(|cx| {
         gpui_kit::open_window(
@@ -137,13 +172,12 @@ fn open_app(
                     Default::default(),
                     // Tall enough for every catalog cell to be visible without
                     // scrolling — UI tests click cells directly.
-                    size(px(360.), px(1400.)),
+                    size(px(360.), px(2200.)),
                 ))),
                 ..Default::default()
             },
             cx,
             |window, cx| {
-                let client = AdbClient::new(PathBuf::from("adb"));
                 let store = cx.new(|cx| DeviceStore::with_devices(client.clone(), devices, cx));
                 cx.new(|cx| {
                     AppView::with_parts(
@@ -525,4 +559,143 @@ fn text_action_types_and_dispatches_on_enter(cx: &mut TestAppContext) {
         "Enter must dispatch the typed text to the type-text feature; calls: {:?}",
         executor.calls()
     );
+}
+
+#[gpui_kit::test]
+fn destructive_action_waits_for_confirmation(cx: &mut TestAppContext) {
+    let executor = Arc::new(RecordingExecutor::new());
+    let handle = open_app(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        executor.clone(),
+    );
+    settle(cx, handle);
+
+    // Clicking a destructive cell opens the confirmation dialog and must NOT
+    // dispatch.
+    cx.update_window(handle, |_, window, cx| {
+        window.click("feature-action:app.clear-data", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dialog").is_some(),
+            "destructive click must open the confirmation dialog"
+        );
+    })
+    .unwrap();
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::Perform { .. })),
+        "no perform may be dispatched before confirmation; calls: {:?}",
+        executor.calls()
+    );
+
+    // Confirming dispatches exactly once. (The dialog confirms on Enter; the
+    // component's internal OK button is not click-reachable through the test
+    // harness's hit testing.)
+    cx.update_window(handle, |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let calls = executor.calls();
+    let performs: Vec<_> = calls
+        .iter()
+        .filter(|call| matches!(call, RecordedCall::Perform { .. }))
+        .collect();
+    assert_eq!(
+        performs.len(),
+        1,
+        "exactly one perform after confirmation; calls: {calls:?}"
+    );
+    assert!(
+        matches!(
+            performs[0],
+            RecordedCall::Perform {
+                feature_id: "app.clear-data",
+                ..
+            }
+        ),
+        "the confirmed action must be clear-data; calls: {calls:?}"
+    );
+}
+
+/// K3: the screenshot must reach the system clipboard even when the
+/// post-perform batched re-read fails — the clipboard offer is gated on the
+/// perform, not the re-read.
+#[gpui_kit::test]
+fn screenshot_clipboard_survives_failed_reread(cx: &mut TestAppContext) {
+    // Keep the saved PNG out of the developer's Pictures dir. Safety: only
+    // this test in the ui_shell binary reads HOME.
+    let scratch = std::env::temp_dir().join(format!("adb-gui-ui-home-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    unsafe { std::env::set_var("HOME", &scratch) };
+
+    let executor = Arc::new(RecordingExecutor::new());
+    executor.set_delegate_perform(true);
+    let handle = open_app_with_client(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        executor.clone(),
+        AdbClient::new(screenshot_fake_adb()),
+    );
+    settle(cx, handle);
+
+    // The perform succeeds (fake adb answers exec-out) but the re-read fails.
+    executor.set_fail_read_all(true);
+    cx.update_window(handle, |_, window, cx| {
+        window.click("feature-action:capture.screenshot", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let clipboard = cx
+        .update(|cx| cx.read_from_clipboard())
+        .expect("clipboard must be written even when the re-read fails");
+    let has_image = clipboard.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            gpui_kit::ClipboardEntry::Image(image)
+                if image.bytes.starts_with(b"\x89PNG\r\n\x1a\nFAKE-SCREENSHOT")
+        )
+    });
+    assert!(
+        has_image,
+        "the screenshot PNG must be on the clipboard despite the failed re-read: {clipboard:?}"
+    );
+
+    // The re-read failure is still surfaced (display-only): initial read,
+    // perform, then the failed re-read.
+    let calls = executor.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected initial read + perform + failed re-read; calls: {calls:?}"
+    );
+}
+
+/// Fake adb that answers `exec-out screencap -p` with PNG marker bytes.
+#[cfg(unix)]
+fn screenshot_fake_adb() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("adb-gui-ui-shot-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fake-adb-ui-shot");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$3\" = \"exec-out\" ]; then printf '\\x89PNG\\r\\n\\x1a\\nFAKE-SCREENSHOT'; fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
 }

@@ -3,16 +3,30 @@
 //! oh-my-android's sectioned catalog).
 
 pub mod animations;
+pub mod app_info;
+pub mod clear_data;
 pub mod dark_mode;
+pub mod deep_link;
 pub mod display_size;
 pub mod font_scale;
+pub mod force_stop;
+pub mod foreground_app;
 pub mod hide_keyboard;
+pub mod install_apk;
 pub mod layout_bounds;
 pub mod locale;
 pub mod navigation;
+pub mod pictures;
+pub mod reset_permissions;
+pub mod restart_app;
+pub mod screen_record;
+pub mod screenshot;
 pub mod state_reader;
 pub mod talkback;
+#[cfg(all(test, unix))]
+pub(crate) mod test_util;
 pub mod type_text;
+pub mod uninstall;
 
 use std::sync::Arc;
 
@@ -48,11 +62,31 @@ pub fn all_features() -> FeatureRegistry {
                 Arc::new(hide_keyboard::HideKeyboard),
             ],
         ),
+        (
+            "Capture",
+            vec![
+                Arc::new(screenshot::Screenshot::new()),
+                Arc::new(screen_record::ScreenRecord::new()),
+            ],
+        ),
+        (
+            "App",
+            vec![
+                Arc::new(restart_app::RestartApp),
+                Arc::new(clear_data::ClearData),
+                Arc::new(force_stop::ForceStop),
+                Arc::new(uninstall::Uninstall),
+                Arc::new(reset_permissions::ResetPermissions),
+                Arc::new(app_info::AppInfo),
+                Arc::new(deep_link::DeepLink),
+                Arc::new(install_apk::InstallApk),
+            ],
+        ),
     ])
 }
 
 /// Map one batched device read to a feature's display state. Features with
-/// nothing readable (nav keys, type text) get [`FeatureState::None`].
+/// nothing readable (nav keys, capture, app actions) get [`FeatureState::None`].
 pub(crate) fn apply_state(
     feature: &dyn Feature,
     state: &state_reader::BatchedState,

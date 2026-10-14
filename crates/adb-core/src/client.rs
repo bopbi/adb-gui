@@ -58,6 +58,38 @@ impl AdbClient {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// `adb -s <serial> install -r <apk_path>` — client-side install of an
+    /// APK already on this machine. `apk_path` is one argv element (paths
+    /// with spaces are safe). stderr surfaces on failure via
+    /// [`AdbError::CommandFailed`].
+    pub fn install(&self, serial: &str, apk_path: &str) -> Result<String> {
+        let output = self.run(&["-s", serial, "install", "-r", apk_path])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// `adb -s <serial> pull <remote> <local>` — pull a device file to a
+    /// local path (e.g. a finished screen recording).
+    pub fn pull(&self, serial: &str, remote: &str, local: &str) -> Result<String> {
+        let output = self.run(&["-s", serial, "pull", remote, local])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Spawn a long-lived `adb -s <serial> shell <args>` process that
+    /// outlives the 30 s watchdog — for streaming commands like
+    /// `screenrecord`. The returned guard owns the child: [`ShellChild::stop`]
+    /// kills and reaps it, and an unfinished child is killed on drop, so a
+    /// recording can never leak past its owner.
+    pub fn spawn_shell_child(&self, serial: &str, args: &[&str]) -> Result<ShellChild> {
+        let argv = [&["-s", serial, "shell"], args].concat();
+        let child = std::process::Command::new(&self.adb_path)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(ShellChild { child: Some(child) })
+    }
+
     /// Spawn `adb_path + args`, watch with a timeout, capture both streams.
     ///
     /// stdout/stderr are drained on dedicated threads so a chatty child can
@@ -102,6 +134,37 @@ impl AdbClient {
             stdout,
             stderr,
         })
+    }
+}
+
+/// Owner of a long-lived adb shell child spawned by
+/// [`AdbClient::spawn_shell_child`]. Kill-on-drop: an unfinished child is
+/// killed and reaped when the guard drops, so a device recording never
+/// outlives the cell that started it.
+pub struct ShellChild {
+    child: Option<Child>,
+}
+
+impl ShellChild {
+    /// The child's OS pid, while it is still tracked.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    /// Kill and reap the child. Idempotent; takes the child, so a later drop
+    /// is a no-op.
+    pub fn stop(&mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShellChild {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -278,5 +341,39 @@ fi"#,
             "watchdog should fire near 100ms, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn spawn_shell_child_runs_until_stopped_and_dies_on_drop() {
+        let adb = script("fake-adb-spawn", "sleep 60");
+        let client = AdbClient::new(adb);
+
+        let mut child = client
+            .spawn_shell_child("serial123", &["screenrecord", "/sdcard/rec.mp4"])
+            .unwrap();
+        let pid = child.pid().expect("child has a pid");
+        assert!(pid_alive(pid), "child must be running after spawn");
+
+        child.stop().unwrap();
+        assert!(!pid_alive(pid), "stop must kill and reap the child");
+        // stop is idempotent.
+        child.stop().unwrap();
+
+        let dropped = client.spawn_shell_child("s", &["sleep"]).unwrap();
+        let pid = dropped.pid().expect("child has a pid");
+        assert!(pid_alive(pid));
+        drop(dropped);
+        assert!(!pid_alive(pid), "drop must kill an unfinished child");
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // `kill -0` probes for existence without affecting the process.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

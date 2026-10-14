@@ -16,7 +16,7 @@ mod sdk;
 pub mod shell_quote;
 mod track;
 
-pub use client::AdbClient;
+pub use client::{AdbClient, ShellChild};
 pub use device::{Device, DeviceState, parse_devices};
 pub use error::{AdbError, Result};
 pub use sdk::find_adb;
