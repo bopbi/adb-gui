@@ -25,6 +25,9 @@ pub const TRANSITION_ANIMATION_SCALE: &str = "transition_animation_scale";
 pub const ANIMATOR_DURATION_SCALE: &str = "animator_duration_scale";
 pub const SYSTEM_LOCALES: &str = "system_locales";
 pub const DEBUG_LAYOUT: &str = "debug_layout";
+pub const AIRPLANE_MODE: &str = "airplane_mode";
+pub const WIFI_ON: &str = "wifi_on";
+pub const MOBILE_DATA: &str = "mobile_data";
 
 /// The fixed, ordered query table — one entry per readable value.
 pub const QUERIES: &[Query] = &[
@@ -69,6 +72,18 @@ pub const QUERIES: &[Query] = &[
     Query {
         key: DEBUG_LAYOUT,
         command: "getprop debug.layout",
+    },
+    Query {
+        key: AIRPLANE_MODE,
+        command: "settings get global airplane_mode_on",
+    },
+    Query {
+        key: WIFI_ON,
+        command: "settings get global wifi_on",
+    },
+    Query {
+        key: MOBILE_DATA,
+        command: "settings get global mobile_data",
     },
 ];
 

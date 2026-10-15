@@ -27,8 +27,8 @@ use adb_core::{AdbClient, Device, DeviceState, find_adb};
 use crate::device_store::DeviceStore;
 use crate::executor::{AdbExecutor, FeatureExecutor};
 use crate::feature::{
-    ClipboardPayload, Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState,
-    StepperSpec,
+    Availability, ClipboardPayload, Feature, FeatureInput, FeatureKind, FeatureRegistry,
+    FeatureState, StepperSpec,
 };
 use crate::features::all_features;
 use crate::features::install_apk::INSTALL_APK_ID;
@@ -610,18 +610,35 @@ impl AppView {
     ) -> AnyElement {
         let feature = &self.registry.features()[ix];
         let cell = &self.cells[ix];
-        let enabled = grid_enabled && !cell.busy;
+        // The emulator-only guard lives here, once: features never re-check.
+        let selected_is_emulator = self
+            .selected_serial
+            .as_ref()
+            .and_then(|serial| self.devices.iter().find(|d| &d.serial == serial))
+            .is_some_and(|device| device.is_emulator());
+        let emulator_only_blocked =
+            matches!(feature.availability(), Availability::EmulatorOnly) && !selected_is_emulator;
+        let enabled = grid_enabled && !cell.busy && !emulator_only_blocked;
+        let blocked_reason: Option<&str> =
+            emulator_only_blocked.then_some("Emulator only — connect an emulator to use this");
 
         let control: AnyElement = match feature.kind() {
             FeatureKind::Toggle => {
                 let checked = matches!(&cell.state, FeatureState::Toggle(true));
-                Switch::new(format!("feature-toggle:{}", feature.id()))
+                let switch = Switch::new(format!("feature-toggle:{}", feature.id()))
                     .checked(checked)
                     .disabled(!enabled)
                     .on_change(cx.listener(move |this, checked: &bool, window, cx| {
                         this.on_feature_input(ix, FeatureInput::Bool(*checked), window, cx);
-                    }))
-                    .into_any_element()
+                    }));
+                // Tooltips are supported on Switch and Button; other control
+                // kinds show the reason as a cell label below.
+                let switch = if let Some(reason) = blocked_reason {
+                    switch.tooltip(reason)
+                } else {
+                    switch
+                };
+                switch.into_any_element()
             }
             FeatureKind::Stepper(spec) => {
                 let current = match &cell.state {
@@ -694,14 +711,21 @@ impl AppView {
                     .disabled(!enabled)
                     .into_any_element()
             }
-            FeatureKind::Action => Button::new(format!("feature-action:{}", feature.id()))
-                .label(feature.title())
-                .disabled(!enabled)
-                .when(feature.is_destructive(), |button| button.danger())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.on_feature_input(ix, FeatureInput::None, window, cx);
-                }))
-                .into_any_element(),
+            FeatureKind::Action => {
+                let button = Button::new(format!("feature-action:{}", feature.id()))
+                    .label(feature.title())
+                    .disabled(!enabled)
+                    .when(feature.is_destructive(), |button| button.danger())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.on_feature_input(ix, FeatureInput::None, window, cx);
+                    }));
+                let button = if let Some(reason) = blocked_reason {
+                    button.tooltip(reason)
+                } else {
+                    button
+                };
+                button.into_any_element()
+            }
             FeatureKind::TextAction => {
                 let input = cell
                     .input
@@ -726,6 +750,9 @@ impl AppView {
             .border_color(cx.theme().border)
             .child(Label::new(feature.title()))
             .child(control)
+            .when_some(blocked_reason, |this, reason| {
+                this.child(Label::new(reason).text_color(cx.theme().muted_foreground))
+            })
             .when_some(cell.error.clone(), |this, error| {
                 this.child(Label::new(error).text_color(cx.theme().danger))
             })

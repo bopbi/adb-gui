@@ -58,6 +58,35 @@ pub fn clean_up(log: &Path) {
     let _ = fs::remove_file(log);
 }
 
+/// Fake adb with an emulator console: logs every argv; answers
+/// `emu power display` with a status block (capacity 50) and
+/// `settings get global wifi_on` / `settings get global mobile_data` with 1.
+/// `name` must be unique per test.
+pub fn fake_adb_emu(name: &str, log: &Path) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("adb-gui-emu-actions-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \"$*\" in\n\
+             *'emu power display') printf 'OK\\nAC: connected\\nstatus: Charging\\ncapacity: 50\\n' ;;
+             *'emu power capacity') printf 'KO: missing argument\\n' ;;\n\
+             *'settings get global wifi_on') printf '1\\n' ;;\n\
+             *'settings get global mobile_data') printf '1\\n' ;;\n\
+             esac\n\
+             exit 0\n",
+            log = log.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 /// Env-mutation lock: tests that redirect HOME take this guard so they
 /// cannot interfere with each other (tests run in parallel threads).
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

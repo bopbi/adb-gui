@@ -699,3 +699,65 @@ fn screenshot_fake_adb() -> PathBuf {
     std::fs::set_permissions(&path, perms).unwrap();
     path
 }
+
+/// Step 1: emulator-only cells render disabled on a physical device and
+/// never dispatch; the same cells work when an emulator is selected.
+#[gpui_kit::test]
+fn emulator_only_cells_are_disabled_on_physical_device(cx: &mut TestAppContext) {
+    let physical = Arc::new(RecordingExecutor::new());
+    let physical_handle = open_app(
+        cx,
+        vec![usable_device("pixel7-abc123", "Pixel 7")],
+        physical.clone(),
+    );
+    settle(cx, physical_handle);
+
+    cx.update_window(physical_handle, |_, window, cx| {
+        // The guard is honored for every control kind: a Toggle (battery
+        // charging), a Stepper (battery level), a Choice select (network
+        // speed), and a TextAction (incoming call input).
+        window.click("feature-toggle:simulate.battery-charging", cx);
+        window.click("feature-stepper-plus:simulate.battery-level", cx);
+        window
+            .within("feature-choice:network.speed")
+            .click("input", cx);
+        window.click("feature-input:simulate.incoming-call", cx);
+        window.input("5551234", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        physical
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::Perform { .. })),
+        "emulator-only cells must never dispatch on a physical device; calls: {:?}",
+        physical.calls()
+    );
+
+    // On an emulator the same controls dispatch.
+    let emulator = Arc::new(RecordingExecutor::new());
+    let emulator_handle = open_app(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        emulator.clone(),
+    );
+    settle(cx, emulator_handle);
+    cx.update_window(emulator_handle, |_, window, cx| {
+        window.click("feature-toggle:simulate.battery-charging", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        emulator.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::Perform {
+                feature_id: "simulate.battery-charging",
+                ..
+            }
+        )),
+        "emulator-only cells must dispatch on an emulator; calls: {:?}",
+        emulator.calls()
+    );
+}

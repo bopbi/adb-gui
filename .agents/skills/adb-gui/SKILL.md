@@ -38,9 +38,11 @@ the canonical patterns. Load vendored references only for the topic at hand.
    Nothing else changes: the grid, picker gating, executor dispatch, and
    error notifications are already generic over `FeatureKind` (`Toggle`,
    `Stepper(StepperSpec)`, `Choice`, `Action`, `TextAction`).
-3. `Availability::EmulatorOnly` features: guard `perform` against physical
-   devices (check `serial` prefix or surface a clear error); the shell does
-   not gate availability yet.
+3. `Availability::EmulatorOnly` features: return the variant from
+   `availability()` — the shell's renderer already disables the cell (with an
+   "Emulator only" tooltip/reason) on physical devices, features never
+   re-check. Keep a cheap guard inside `perform` only as defense-in-depth
+   when a command could harm a physical device.
 
 Rules that are easy to break:
 
