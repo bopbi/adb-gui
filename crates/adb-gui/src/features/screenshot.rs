@@ -120,7 +120,7 @@ mod tests {
                 &path,
                 format!(
                     "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
-                     if [ \"$3\" = \"exec-out\" ]; then printf '\\x89PNG\\r\\n\\x1a\\nfake'; fi\n\
+                     if [ \"$3\" = \"exec-out\" ]; then printf '\\211PNG\\r\\n\\032\\nfake'; fi\n\
                      exit 0\n",
                     log.display()
                 ),

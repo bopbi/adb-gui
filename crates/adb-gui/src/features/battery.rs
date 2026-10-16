@@ -3,7 +3,7 @@
 
 use adb_core::{AdbClient, AdbError};
 
-use crate::feature::{Availability, Feature, FeatureInput, FeatureKind, StepperSpec};
+use crate::feature::{Availability, Feature, FeatureInput, FeatureKind, FeatureState, StepperSpec};
 
 pub const BATTERY_LEVEL_ID: &str = "simulate.battery-level";
 pub const BATTERY_CHARGING_ID: &str = "simulate.battery-charging";
@@ -12,8 +12,8 @@ const BATTERY_STEP: i32 = 10;
 
 /// Relative stepper: the −/+ buttons send `Index(0)`/`Index(1)`; the current
 /// capacity is read from the console, stepped by 10, and clamped to 0–100.
-/// The console cannot join the device-shell batch, so the cell value shows
-/// "Default" until the part-03 shell grows an emulator read path.
+/// Console reads cannot join the batched device-shell read, so the executor
+/// issues them separately for emulators (see `AdbExecutor::read_all`).
 pub struct BatteryLevel;
 
 impl Feature for BatteryLevel {
@@ -84,6 +84,28 @@ fn parse_capacity(display: &str) -> Option<i32> {
 
 /// Charging toggle: `emu power ac on|off`.
 pub struct BatteryCharging;
+
+impl BatteryCharging {
+    /// Map a `power display` status block to the toggle's state: the `AC:`
+    /// line is `connected` (charging) or `disconnected` (not charging).
+    /// Tolerates the console's formatting and unknown output →
+    /// [`FeatureState::None`], matching `parse_capacity`'s line-scan style.
+    pub(crate) fn apply_power_display(display: &str) -> FeatureState {
+        for line in display.lines() {
+            let lower = line.to_ascii_lowercase();
+            let mut parts = lower.split(':');
+            if parts.next().map(str::trim) != Some("ac") {
+                continue;
+            }
+            return match parts.next().map(str::trim) {
+                Some("connected") => FeatureState::Toggle(true),
+                Some("disconnected") => FeatureState::Toggle(false),
+                _ => FeatureState::None,
+            };
+        }
+        FeatureState::None
+    }
+}
 
 impl Feature for BatteryCharging {
     fn id(&self) -> &'static str {
@@ -160,6 +182,36 @@ mod tests {
         assert_eq!(parse_capacity("KO: unknown command"), None);
         assert_eq!(parse_capacity("capacity: garbage"), None);
         assert_eq!(parse_capacity(""), None);
+    }
+
+    #[test]
+    fn apply_power_display_maps_the_ac_line() {
+        let display = "power display\n  AC: connected\n  status: Charging\n  capacity: 50\n";
+        assert!(matches!(
+            BatteryCharging::apply_power_display(display),
+            FeatureState::Toggle(true)
+        ));
+        assert!(matches!(
+            BatteryCharging::apply_power_display("AC: disconnected"),
+            FeatureState::Toggle(false)
+        ));
+        // No AC line, or a malformed one: unknown state, never a wrong toggle.
+        assert!(matches!(
+            BatteryCharging::apply_power_display("capacity: 50\nstatus: Charging"),
+            FeatureState::None
+        ));
+        assert!(matches!(
+            BatteryCharging::apply_power_display("AC: whatever\n"),
+            FeatureState::None
+        ));
+        assert!(matches!(
+            BatteryCharging::apply_power_display("KO: unknown command"),
+            FeatureState::None
+        ));
+        assert!(matches!(
+            BatteryCharging::apply_power_display(""),
+            FeatureState::None
+        ));
     }
 
     #[test]

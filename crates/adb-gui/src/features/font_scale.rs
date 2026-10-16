@@ -121,7 +121,7 @@ mod tests {
                 feature
                     .perform(&client, "s", FeatureInput::Index(ix))
                     .unwrap();
-                let want = format!("-s s shell settings put system font_scale {expected}");
+                let want = format!("-s s shell settings put system font_scale '{expected}'");
                 let logged = fs::read_to_string(&log).unwrap();
                 assert!(
                     logged.lines().any(|line| line == want),

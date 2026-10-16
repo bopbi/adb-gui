@@ -79,10 +79,10 @@ mod tests {
         assert_eq!(
             test_util::logged(&log),
             [
-                "-s s shell settings put global airplane_mode_on 1".to_string(),
+                "-s s shell settings put global airplane_mode_on '1'".to_string(),
                 "-s s shell am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"
                     .to_string(),
-                "-s s shell settings put global airplane_mode_on 0".to_string(),
+                "-s s shell settings put global airplane_mode_on '0'".to_string(),
                 "-s s shell am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
                     .to_string(),
             ],

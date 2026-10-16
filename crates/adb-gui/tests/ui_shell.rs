@@ -690,7 +690,7 @@ fn screenshot_fake_adb() -> PathBuf {
     std::fs::write(
         &path,
         "#!/bin/sh\n\
-         if [ \"$3\" = \"exec-out\" ]; then printf '\\x89PNG\\r\\n\\x1a\\nFAKE-SCREENSHOT'; fi\n\
+         if [ \"$3\" = \"exec-out\" ]; then printf '\\211PNG\\r\\n\\032\\nFAKE-SCREENSHOT'; fi\n\
          exit 0\n",
     )
     .unwrap();

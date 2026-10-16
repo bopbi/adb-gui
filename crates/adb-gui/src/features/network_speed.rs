@@ -49,6 +49,23 @@ pub const PROFILES: &[ChoiceOption] = &[
     },
 ];
 
+/// Latency paired with each speed profile, per oh-my-android's table. The
+/// emulator console's `network delay` accepts `gprs|edge|umts|none|<min>[:<max>]`,
+/// so profiles without a named entry map to a `min:max` range (hscsd has no
+/// upstream entry; GPRS-class latency is the closest named profile). Both
+/// `full` and `default` mean no throttling → `none`.
+pub fn delay_for(profile_id: &str) -> &'static str {
+    match profile_id {
+        "gsm" => "600:1200",
+        "hscsd" | "gprs" => "gprs",
+        "edge" => "edge",
+        "umts" => "umts",
+        "hsdpa" => "80:150",
+        "lte" => "30:60",
+        _ => "none",
+    }
+}
+
 pub struct NetworkSpeed;
 
 impl Feature for NetworkSpeed {
@@ -88,7 +105,7 @@ impl Feature for NetworkSpeed {
             profile.id
         };
         client.emu(serial, &["network", "speed", profile_id])?;
-        client.emu(serial, &["network", "delay", profile_id])?;
+        client.emu(serial, &["network", "delay", delay_for(profile.id)])?;
         Ok(())
     }
 }
@@ -104,6 +121,21 @@ mod tests {
             NetworkSpeed.availability(),
             Availability::EmulatorOnly
         ));
+        // Paired delay values from oh-my-android's table.
+        for (profile_id, expected_delay) in [
+            ("gsm", "600:1200"),
+            ("hscsd", "gprs"),
+            ("gprs", "gprs"),
+            ("edge", "edge"),
+            ("umts", "umts"),
+            ("hsdpa", "80:150"),
+            ("lte", "30:60"),
+            ("full", "none"),
+            ("default", "none"),
+        ] {
+            assert_eq!(delay_for(profile_id), expected_delay, "{profile_id}");
+        }
+
         let log = test_util::log_path("network-speed");
         let client = AdbClient::new(test_util::fake_adb_emu("fake-adb-net-speed", &log));
         let edge_ix = PROFILES.iter().position(|p| p.id == "edge").unwrap();
@@ -117,6 +149,20 @@ mod tests {
             [
                 "-s emulator-5554 emu network speed edge".to_string(),
                 "-s emulator-5554 emu network delay edge".to_string(),
+            ],
+        );
+        test_util::clean_up(&log);
+
+        let lte_ix = PROFILES.iter().position(|p| p.id == "lte").unwrap();
+        NetworkSpeed
+            .perform(&client, "emulator-5554", FeatureInput::Index(lte_ix))
+            .unwrap();
+
+        assert_eq!(
+            test_util::logged(&log),
+            [
+                "-s emulator-5554 emu network speed lte".to_string(),
+                "-s emulator-5554 emu network delay 30:60".to_string(),
             ],
         );
         test_util::clean_up(&log);
@@ -150,7 +196,7 @@ mod tests {
             test_util::logged(&log),
             [
                 "-s emulator-5554 emu network speed full".to_string(),
-                "-s emulator-5554 emu network delay full".to_string(),
+                "-s emulator-5554 emu network delay none".to_string(),
             ],
         );
         test_util::clean_up(&log);

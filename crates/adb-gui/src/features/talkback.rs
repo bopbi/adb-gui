@@ -51,6 +51,22 @@ impl Feature for TalkBack {
         let FeatureInput::Bool(on) = input else {
             return Ok(());
         };
+        // Read-modify-write the service list: writing the whole value would
+        // wipe accessibility services installed by other apps.
+        let current = client.shell(
+            serial,
+            &[
+                "settings",
+                "get",
+                "secure",
+                "enabled_accessibility_services",
+            ],
+        )?;
+        let mut services: Vec<&str> = current
+            .trim()
+            .split(':')
+            .filter(|entry| !entry.is_empty() && *entry != "null")
+            .collect();
         if on {
             // Refuse to "enable" a component that is not installed — a
             // missing service would silently no-op on the device.
@@ -61,23 +77,28 @@ impl Feature for TalkBack {
                     stderr: "TalkBack is not installed on this device".to_string(),
                 });
             }
+            if !services.contains(&TALKBACK_COMPONENT) {
+                services.push(TALKBACK_COMPONENT);
+            }
             state_reader::put_setting(
                 client,
                 serial,
                 "secure",
                 "enabled_accessibility_services",
-                TALKBACK_COMPONENT,
+                &services.join(":"),
             )?;
             state_reader::put_setting(client, serial, "secure", "accessibility_enabled", "1")
         } else {
+            services.retain(|entry| *entry != TALKBACK_COMPONENT);
+            let enabled = if services.is_empty() { "0" } else { "1" };
             state_reader::put_setting(
                 client,
                 serial,
                 "secure",
                 "enabled_accessibility_services",
-                "",
+                &services.join(":"),
             )?;
-            state_reader::put_setting(client, serial, "secure", "accessibility_enabled", "0")
+            state_reader::put_setting(client, serial, "secure", "accessibility_enabled", enabled)
         }
     }
 }
@@ -113,8 +134,10 @@ mod tests {
         }
     }
 
-    // Command-string tests: fake adb logs every argv it receives and answers
-    // `pm path` (installed vs not installed).
+    // Command-string tests: fake adb logs every argv it receives (one
+    // `<arg>` per argv element, so a trailing empty element stays visible),
+    // answers `settings get secure enabled_accessibility_services` with a
+    // foreign service fixture, and answers `pm path` (installed or not).
     #[cfg(all(test, unix))]
     mod argv {
         use super::*;
@@ -122,22 +145,26 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
 
-        fn fake_adb(name: &str, log: &Path, installed: bool) -> PathBuf {
+        fn fake_adb(name: &str, log: &Path, installed: bool, services: &str) -> PathBuf {
             let dir =
                 std::env::temp_dir().join(format!("adb-gui-talkback-test-{}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join(name);
             let answer = if installed {
-                format!("package:{TALKBACK_PACKAGE}\n")
+                format!("package:{TALKBACK_PACKAGE}\\n")
             } else {
                 String::new()
             };
             fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                    "#!/bin/sh\n\
+                     {{ printf '<%s>' \"$@\"; printf '\\n'; }} >> \"{log}\"\n\
+                     if [ \"$4\" = \"settings\" ] && [ \"$5\" = \"get\" ]; then\n\
+                     \x20 printf '%s\\n' '{services}'\n\
+                     fi\n\
                      if [ \"$4\" = \"pm\" ]; then printf '{answer}'; fi\n",
-                    log.display()
+                    log = log.display(),
                 ),
             )
             .unwrap();
@@ -145,6 +172,12 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&path, perms).unwrap();
             path
+        }
+
+        /// One logged adb invocation: every argv element bracketed, so an
+        /// empty (or quoted-empty) element is observable.
+        fn call(args: &[&str]) -> String {
+            args.iter().map(|arg| format!("<{arg}>")).collect()
         }
 
         fn logged(log: &Path) -> Vec<String> {
@@ -155,25 +188,52 @@ mod tests {
                 .collect()
         }
 
+        const READ: &[&str] = &[
+            "-s",
+            "s",
+            "shell",
+            "settings",
+            "get",
+            "secure",
+            "enabled_accessibility_services",
+        ];
+
         #[test]
-        fn enable_probes_pm_path_then_sets_both_settings() {
+        fn enable_keeps_foreign_service_and_appends_talkback() {
             let log =
                 std::env::temp_dir().join(format!("adb-gui-tb-on-log-{}", std::process::id()));
             let _ = fs::remove_file(&log);
-            let client = AdbClient::new(fake_adb("fake-adb-tb-on", &log, true));
+            let client = AdbClient::new(fake_adb("fake-adb-tb-on", &log, true, "com.svc/other"));
             TalkBack
                 .perform(&client, "s", FeatureInput::Bool(true))
                 .unwrap();
 
-            let component_setting = format!(
-                "-s s shell settings put secure enabled_accessibility_services {TALKBACK_COMPONENT}"
-            );
+            let kept = format!("com.svc/other:{TALKBACK_COMPONENT}");
             assert_eq!(
                 logged(&log),
                 [
-                    format!("-s s shell pm path {TALKBACK_PACKAGE}"),
-                    component_setting,
-                    "-s s shell settings put secure accessibility_enabled 1".to_string(),
+                    call(READ),
+                    call(&["-s", "s", "shell", "pm", "path", TALKBACK_PACKAGE]),
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "enabled_accessibility_services",
+                        &format!("'{kept}'"),
+                    ]),
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "accessibility_enabled",
+                        "'1'",
+                    ]),
                 ],
             );
             let _ = fs::remove_file(&log);
@@ -184,7 +244,12 @@ mod tests {
             let log =
                 std::env::temp_dir().join(format!("adb-gui-tb-missing-log-{}", std::process::id()));
             let _ = fs::remove_file(&log);
-            let client = AdbClient::new(fake_adb("fake-adb-tb-missing", &log, false));
+            let client = AdbClient::new(fake_adb(
+                "fake-adb-tb-missing",
+                &log,
+                false,
+                "com.svc/other",
+            ));
             let err = TalkBack
                 .perform(&client, "s", FeatureInput::Bool(true))
                 .unwrap_err();
@@ -192,31 +257,99 @@ mod tests {
                 err.to_string().contains("TalkBack is not installed"),
                 "unexpected error: {err}"
             );
-            // Only the pm probe ran — no settings writes.
+            // Only the read and the pm probe ran — no settings writes.
             assert_eq!(
                 logged(&log),
-                [format!("-s s shell pm path {TALKBACK_PACKAGE}")]
+                [
+                    call(READ),
+                    call(&["-s", "s", "shell", "pm", "path", TALKBACK_PACKAGE]),
+                ]
             );
             let _ = fs::remove_file(&log);
         }
 
         #[test]
-        fn disable_clears_both_settings() {
+        fn disable_removes_only_talkback_and_keeps_foreign_service() {
             let log =
                 std::env::temp_dir().join(format!("adb-gui-tb-off-log-{}", std::process::id()));
             let _ = fs::remove_file(&log);
-            let client = AdbClient::new(fake_adb("fake-adb-tb-off", &log, false));
+            let client = AdbClient::new(fake_adb(
+                "fake-adb-tb-off",
+                &log,
+                false,
+                &format!("com.svc/other:{TALKBACK_COMPONENT}"),
+            ));
             TalkBack
                 .perform(&client, "s", FeatureInput::Bool(false))
                 .unwrap();
 
-            // The cleared service list is an empty argv element; `"$*"` logs
-            // it as a trailing space, not as visible quotes.
             assert_eq!(
                 logged(&log),
                 [
-                    "-s s shell settings put secure enabled_accessibility_services ",
-                    "-s s shell settings put secure accessibility_enabled 0",
+                    call(READ),
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "enabled_accessibility_services",
+                        "'com.svc/other'",
+                    ]),
+                    // Other services remain, so accessibility stays enabled.
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "accessibility_enabled",
+                        "'1'",
+                    ]),
+                ],
+            );
+            let _ = fs::remove_file(&log);
+        }
+
+        #[test]
+        fn disable_with_no_other_services_writes_quoted_empty_and_zero() {
+            let log =
+                std::env::temp_dir().join(format!("adb-gui-tb-none-log-{}", std::process::id()));
+            let _ = fs::remove_file(&log);
+            // The device answers `null` (settings' unset marker): the list
+            // parses to empty, so the cleared value must be a real empty
+            // string — quoted `''` — not a dropped argv element.
+            let client = AdbClient::new(fake_adb("fake-adb-tb-none", &log, false, "null"));
+            TalkBack
+                .perform(&client, "s", FeatureInput::Bool(false))
+                .unwrap();
+
+            assert_eq!(
+                logged(&log),
+                [
+                    call(READ),
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "enabled_accessibility_services",
+                        "''",
+                    ]),
+                    call(&[
+                        "-s",
+                        "s",
+                        "shell",
+                        "settings",
+                        "put",
+                        "secure",
+                        "accessibility_enabled",
+                        "'0'",
+                    ]),
                 ],
             );
             let _ = fs::remove_file(&log);

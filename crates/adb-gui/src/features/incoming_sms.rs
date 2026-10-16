@@ -53,11 +53,11 @@ impl Feature for IncomingSms {
                 stderr: "message must not be empty".to_string(),
             });
         }
-        incoming_call::validate_number("sms send", number)?;
+        let number = incoming_call::normalize_number("sms send", number)?;
         // The console tokenizes on whitespace and takes the rest of the line
         // as the message — it is NOT a shell, so no quoting: pass the raw
         // text as one argv element.
-        client.emu(serial, &["sms", "send", number, message])?;
+        client.emu(serial, &["sms", "send", &number, message])?;
         Ok(())
     }
 }
@@ -83,6 +83,27 @@ mod tests {
         assert_eq!(
             test_util::logged(&log),
             ["-s emulator-5554 emu sms send 5551234 it's $(here)".to_string()],
+        );
+        test_util::clean_up(&log);
+    }
+
+    #[test]
+    fn sms_normalizes_a_formatted_number_and_keeps_the_message_intact() {
+        let log = test_util::log_path("sms-formatted");
+        let client = AdbClient::new(test_util::fake_adb_emu("fake-adb-sms-formatted", &log));
+        IncomingSms
+            .perform(
+                &client,
+                "emulator-5554",
+                FeatureInput::Text("+1 (555) 123-4567: running late, be there soon".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            test_util::logged(&log),
+            [
+                "-s emulator-5554 emu sms send +15551234567 running late, be there soon"
+                    .to_string()
+            ],
         );
         test_util::clean_up(&log);
     }

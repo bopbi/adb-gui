@@ -133,6 +133,8 @@ pub fn parse(output: &str) -> BatchedState {
 }
 
 /// Shared `settings put` pattern for features that write a single setting.
+/// The value is shell-quoted so it survives argv joining as exactly one word —
+/// including an empty value, which would otherwise vanish from the command.
 pub fn put_setting(
     client: &AdbClient,
     serial: &str,
@@ -140,7 +142,8 @@ pub fn put_setting(
     key: &str,
     value: &str,
 ) -> Result<(), AdbError> {
-    client.shell(serial, &["settings", "put", table, key, value])?;
+    let quoted = adb_core::shell_quote::quote_for_shell(value);
+    client.shell(serial, &["settings", "put", table, key, &quoted])?;
     Ok(())
 }
 

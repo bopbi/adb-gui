@@ -173,9 +173,9 @@ exit 0"#,
                 logged(&log),
                 [
                     "-s s shell cmd uimode night yes",
-                    "-s s shell settings put secure ui_night_mode 2",
+                    "-s s shell settings put secure ui_night_mode '2'",
                     "-s s shell cmd uimode night no",
-                    "-s s shell settings put secure ui_night_mode 1",
+                    "-s s shell settings put secure ui_night_mode '1'",
                 ],
             );
         }

@@ -150,6 +150,7 @@ impl DeviceStore {
         }
 
         let changed = merged != self.devices;
+        prune_enriched(&mut self.enriched, &merged);
         self.devices = merged;
         let selection_changed = self.reconcile_selection();
         self.enqueue_enrichment(cx);
@@ -228,3 +229,51 @@ impl DeviceStore {
 }
 
 impl EventEmitter<DeviceStoreEvent> for DeviceStore {}
+
+/// Forget serials no longer in the snapshot so a device that disconnects and
+/// reconnects is re-enriched when it comes back.
+fn prune_enriched(enriched: &mut HashSet<String>, devices: &[Device]) {
+    enriched.retain(|serial| devices.iter().any(|d| d.serial == *serial));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(serial: &str) -> Device {
+        Device {
+            serial: serial.to_string(),
+            state: DeviceState::Device,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn prune_forgets_departed_serials_and_keeps_present_ones() {
+        let mut enriched: HashSet<String> = ["pixel-8".to_string(), "pixel-9".to_string()].into();
+        let devices = [device("pixel-9"), device("emulator-5554")];
+
+        prune_enriched(&mut enriched, &devices);
+
+        assert!(!enriched.contains("pixel-8"));
+        assert!(enriched.contains("pixel-9"));
+        assert!(!enriched.contains("emulator-5554"));
+    }
+
+    #[test]
+    fn pruned_serial_is_re_enriched_after_reconnect() {
+        // A device was enriched, left the snapshot, and came back: the pruned
+        // serial must not block a fresh enrichment round.
+        let mut enriched: HashSet<String> = ["pixel-8".to_string()].into();
+        prune_enriched(&mut enriched, &[]);
+        assert!(enriched.is_empty());
+
+        let devices = [device("pixel-8")];
+        prune_enriched(&mut enriched, &devices);
+        assert!(enriched.is_empty());
+
+        // enqueue_enrichment's insert() now succeeds again for the reconnected
+        // serial.
+        assert!(enriched.insert("pixel-8".to_string()));
+    }
+}

@@ -118,6 +118,8 @@ pub fn all_features() -> FeatureRegistry {
 
 /// Map one batched device read to a feature's display state. Features with
 /// nothing readable (nav keys, capture, app actions) get [`FeatureState::None`].
+/// Emulator-console-only reads (battery charging) cannot join the batch;
+/// the executor fills those cells with a separate `emu` read afterwards.
 pub(crate) fn apply_state(
     feature: &dyn Feature,
     state: &state_reader::BatchedState,

@@ -282,7 +282,7 @@ fi"#,
         let adb = script(
             "fake-adb-exec-out",
             r#"if [ "$3" = "exec-out" ]; then
-  printf '\x89PNG\r\n\x1a\n\x00\xff\x80binary'
+  printf '\211PNG\r\n\032\n\000\377\200binary'
 else
   echo "bad argv" >&2; exit 1
 fi"#,
