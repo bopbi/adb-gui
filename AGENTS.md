@@ -12,9 +12,33 @@ otherwise type as `adb shell ...` incantations: device state, appearance
 (dark mode, font scale, locale/RTL), network throttling, screenshots, app
 management, and similar.
 
-The repository is at its earliest stage: no source tree or build system exists
-yet. As the stack is chosen, record the real build/test/lint commands below and
-keep this file up to date.
+The chosen stack is **Rust** with the
+[`gpui-kit`](https://github.com/longbridge/gpui-kit) crate (GPUI + component
+library) for the GUI, driving the system `adb` binary.
+
+The workspace has landed: `crates/adb-core` (headless adb client library —
+SDK discovery, `AdbClient`, `track-devices` watcher, device parsing) and
+`crates/adb-gui` (the gpui-kit application shell — device store bridged into
+GPUI, `Feature` trait + registry, feature grid; real feature catalog lands in
+later parts). See the Conventions section for build/test/lint commands and
+`plan/` for the part-by-part roadmap.
+
+## Skills
+
+Before writing or reviewing any GPUI code, read
+`.agents/skills/gpui-kit/SKILL.md` and its `references/coding-guides.md` —
+they are the normative source for architecture, state ownership, public API,
+naming, and testing decisions (including `#[gpui_kit::test]` UI integration
+testing). Use `.agents/skills/gpui-kit-design-guides/` for any visible-surface
+decision (layout, spacing, color, component choice, copy). The skills are
+vendored from upstream and pinned in `.agents/skills/PINNED.md`; do not edit
+them locally.
+
+For project-specific work — adding a device feature to the catalog, extending
+the app shell, writing UI tests, or any gpui-kit 0.7.1 API question — read
+`.agents/skills/adb-gui/SKILL.md` first; it names the canonical pattern files
+and records execution-verified API facts. It complements, never overrides,
+the vendored skills.
 
 ## Environment
 
@@ -26,8 +50,24 @@ keep this file up to date.
 
 ## Conventions
 
-To be filled in as the project takes shape. Update this file once the manifest,
-source layout, and tooling land.
+- Cargo workspace, Rust edition 2024. Two crates:
+  - `crates/adb-core` — headless library; the **only** crate that spawns
+    processes. All device I/O goes through `AdbClient` / `find_adb` /
+    `spawn_device_watcher` here.
+  - `crates/adb-gui` — the GPUI application (presentation only; no process
+    spawning, no adb logic).
+- Dependencies are deliberate and minimal (`adb-core` currently: `thiserror`
+  only). Do not add `tokio`, `regex`, `serde`, or an async runtime without a
+  plan that justifies it — sync `std` + threads suffices.
+- Commands:
+  - `cargo build` — build the workspace
+  - `cargo test -p adb-core` — unit tests (fast, no device needed)
+  - `cargo clippy --workspace -- -D warnings` — lint gate
+  - `cargo fmt --check` — format gate
+  - Device integration tests (opt-in, need a real device/emulator):
+    `ADB_GUI_TEST_DEVICE=1 cargo test -p adb-core --features device-it -- --ignored`
+- Tests use fixture strings and fake adb shell scripts; unit tests never touch
+  a real SDK or device.
 
 ## Working agreements
 

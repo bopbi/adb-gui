@@ -1,0 +1,13 @@
+[package]
+name = "adb-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GPUI desktop GUI for everyday adb operations"
+
+[dependencies]
+adb-core = { path = "../adb-core" }
+gpui-kit = "=0.7.1"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.1", features = ["test-support"] }
