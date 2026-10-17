@@ -28,8 +28,14 @@ impl Feature for ForceStop {
         serial: &str,
         input: FeatureInput,
     ) -> Result<(), AdbError> {
-        perform_action(client, serial, input, |pkg| {
-            vec!["am".into(), "force-stop".into(), pkg.into()]
+        perform_action(client, serial, input, |app| {
+            vec![
+                "am".into(),
+                "force-stop".into(),
+                "--user".into(),
+                app.user.to_string(),
+                app.package.clone(),
+            ]
         })
     }
 }
@@ -48,7 +54,7 @@ mod tests {
             test_util::logged(&log),
             [
                 "-s s shell dumpsys activity activities".to_string(),
-                format!("-s s shell am force-stop {FOREGROUND_PACKAGE}"),
+                format!("-s s shell am force-stop --user 0 {FOREGROUND_PACKAGE}"),
             ],
         );
         test_util::clean_up(&log);

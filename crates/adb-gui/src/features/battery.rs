@@ -87,7 +87,8 @@ pub struct BatteryCharging;
 
 impl BatteryCharging {
     /// Map a `power display` status block to the toggle's state: the `AC:`
-    /// line is `connected` (charging) or `disconnected` (not charging).
+    /// line is `online` (charging) or `offline` (not charging) on the real
+    /// console; `connected`/`disconnected` are tolerated aliases.
     /// Tolerates the console's formatting and unknown output →
     /// [`FeatureState::None`], matching `parse_capacity`'s line-scan style.
     pub(crate) fn apply_power_display(display: &str) -> FeatureState {
@@ -98,8 +99,8 @@ impl BatteryCharging {
                 continue;
             }
             return match parts.next().map(str::trim) {
-                Some("connected") => FeatureState::Toggle(true),
-                Some("disconnected") => FeatureState::Toggle(false),
+                Some("online" | "connected") => FeatureState::Toggle(true),
+                Some("offline" | "disconnected") => FeatureState::Toggle(false),
                 _ => FeatureState::None,
             };
         }
@@ -186,9 +187,18 @@ mod tests {
 
     #[test]
     fn apply_power_display_maps_the_ac_line() {
-        let display = "power display\n  AC: connected\n  status: Charging\n  capacity: 50\n";
+        let display = "power display\n  AC: online\n  status: Charging\n  capacity: 50\n";
         assert!(matches!(
             BatteryCharging::apply_power_display(display),
+            FeatureState::Toggle(true)
+        ));
+        assert!(matches!(
+            BatteryCharging::apply_power_display("AC: offline"),
+            FeatureState::Toggle(false)
+        ));
+        // Tolerated aliases.
+        assert!(matches!(
+            BatteryCharging::apply_power_display("AC: connected"),
             FeatureState::Toggle(true)
         ));
         assert!(matches!(

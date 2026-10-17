@@ -37,17 +37,13 @@ fn lists_devices_and_runs_shell_echo() {
 fn device_watcher_streams_initial_snapshot() {
     require_device_env();
     let adb_path = find_adb().expect("adb not found");
-    let (handle, rx) = spawn_device_watcher(adb_path);
+    let (watcher, rx) = spawn_device_watcher(adb_path);
     let devices = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("no device snapshot within 10s");
     assert!(!devices.is_empty(), "watcher saw no devices");
-    drop(rx);
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(handle.join());
-    });
-    done_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("watcher did not exit after receiver drop");
+    // stop() kills the adb child and joins the thread; the real adb
+    // track-devices process stays alive on a stable list, so without the
+    // guard this join would hang.
+    watcher.stop();
 }

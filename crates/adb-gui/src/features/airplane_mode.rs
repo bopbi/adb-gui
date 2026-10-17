@@ -1,12 +1,15 @@
-//! Airplane mode: the setting alone does not take effect until the
-//! AIRPLANE_MODE broadcast is sent — this feature does both. Works on
-//! physical devices too (availability Always); where `svc`/broadcast is
-//! restricted the stderr surfaces and the toggle reverts on next read.
+//! Airplane mode via `cmd connectivity airplane-mode enable|disable` (API
+//! 30+): it writes the global setting AND transitions the radios, so the
+//! `airplane_mode_on` read-back stays correct. The old setting-plus-broadcast
+//! path is gone — `AIRPLANE_MODE` is a protected broadcast the shell uid may
+//! not send, which left the setting written with the radios unchanged. On
+//! older devices the command fails with a visible error and nothing is
+//! written. Works on physical devices too (availability Always).
 
 use adb_core::{AdbClient, AdbError};
 
 use crate::feature::{Feature, FeatureInput, FeatureKind, FeatureState};
-use crate::features::state_reader::{self, AIRPLANE_MODE, BatchedState};
+use crate::features::state_reader::{AIRPLANE_MODE, BatchedState};
 
 pub const AIRPLANE_MODE_ID: &str = "network.airplane-mode";
 
@@ -40,21 +43,8 @@ impl Feature for AirplaneMode {
         let FeatureInput::Bool(on) = input else {
             return Ok(());
         };
-        let value: &str = if on { "1" } else { "0" };
-        let state: &str = if on { "true" } else { "false" };
-        state_reader::put_setting(client, serial, "global", "airplane_mode_on", value)?;
-        client.shell(
-            serial,
-            &[
-                "am",
-                "broadcast",
-                "-a",
-                "android.intent.action.AIRPLANE_MODE",
-                "--ez",
-                "state",
-                state,
-            ],
-        )?;
+        let command: &str = if on { "enable" } else { "disable" };
+        client.shell(serial, &["cmd", "connectivity", "airplane-mode", command])?;
         Ok(())
     }
 }
@@ -62,10 +52,11 @@ impl Feature for AirplaneMode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::features::state_reader;
     use crate::features::test_util;
 
     #[test]
-    fn airplane_mode_sets_the_setting_then_broadcasts() {
+    fn airplane_mode_uses_cmd_connectivity() {
         let log = test_util::log_path("airplane");
         let client = AdbClient::new(test_util::fake_adb_emu("fake-adb-airplane", &log));
 
@@ -79,13 +70,27 @@ mod tests {
         assert_eq!(
             test_util::logged(&log),
             [
-                "-s s shell settings put global airplane_mode_on '1'".to_string(),
-                "-s s shell am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true"
-                    .to_string(),
-                "-s s shell settings put global airplane_mode_on '0'".to_string(),
-                "-s s shell am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
-                    .to_string(),
+                "-s s shell cmd connectivity airplane-mode enable".to_string(),
+                "-s s shell cmd connectivity airplane-mode disable".to_string(),
             ],
+        );
+        test_util::clean_up(&log);
+    }
+
+    #[test]
+    fn airplane_mode_failure_propagates_and_writes_no_setting() {
+        let log = test_util::log_path("airplane-fail");
+        let client = AdbClient::new(test_util::fake_adb_failing("fake-adb-airplane-fail", &log));
+
+        let err = AirplaneMode
+            .perform(&client, "s", FeatureInput::Bool(true))
+            .unwrap_err();
+        assert!(err.to_string().contains("airplane-mode"), "{err}");
+        assert!(
+            test_util::logged(&log)
+                .iter()
+                .all(|line| !line.contains("settings put")),
+            "a failed command must not fall back to writing the setting"
         );
         test_util::clean_up(&log);
     }

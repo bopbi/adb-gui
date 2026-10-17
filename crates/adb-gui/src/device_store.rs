@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui_kit::{AppContext as _, AsyncApp, Context, EventEmitter, WeakEntity};
 
-use adb_core::{AdbClient, Device, DeviceState, spawn_device_watcher};
+use adb_core::{AdbClient, Device, DeviceState, DeviceWatcher, spawn_device_watcher};
 
 /// Emitted after any coherent change to the store's snapshot or selection.
 #[derive(Clone, Debug)]
@@ -23,9 +23,9 @@ enum BridgeMsg {
 
 /// The device list live from `adb track-devices`, plus the current selection.
 ///
-/// Owns the watcher's receiver: the bridge task polls it with a short timeout
-/// so that when the store entity is released the task ends, the receiver
-/// drops, and the watcher kills its adb child (see `adb_core::track`).
+/// Holds the watcher guard: the bridge task polls the receiver with a short
+/// timeout so that when the store entity is released the task ends, and the
+/// guard's Drop kills the adb child deterministically (see `adb_core::track`).
 pub struct DeviceStore {
     client: AdbClient,
     devices: Vec<Device>,
@@ -33,17 +33,21 @@ pub struct DeviceStore {
     /// Serials whose model was already fetched (or is being fetched) —
     /// enrichment runs at most once per device.
     enriched: HashSet<String>,
+    /// Watcher guard; `None` for `with_devices` (no watcher). Releasing the
+    /// store stops the watcher.
+    _watcher: Option<DeviceWatcher>,
 }
 
 impl DeviceStore {
     /// Start the part-02 watcher and bridge its snapshots into GPUI.
     pub fn new(client: AdbClient, cx: &mut Context<Self>) -> Self {
-        let (_handle, rx) = spawn_device_watcher(client.adb_path.clone());
+        let (watcher, rx) = spawn_device_watcher(client.adb_path.clone());
         let this = Self {
             client,
             devices: Vec::new(),
             selected_serial: None,
             enriched: HashSet::new(),
+            _watcher: Some(watcher),
         };
         this.spawn_bridge(rx, cx);
         this
@@ -58,6 +62,7 @@ impl DeviceStore {
             devices,
             selected_serial: None,
             enriched,
+            _watcher: None,
         };
         if this.reconcile_selection() {
             cx.emit(DeviceStoreEvent::Changed);
@@ -121,8 +126,8 @@ impl DeviceStore {
                                 .ok();
                         }
                         BridgeMsg::Idle => {
-                            // The store entity was released: end the task so the
-                            // receiver drops and the watcher kills adb.
+                            // The store entity was released: end the task; the
+                            // store's guard Drop then stops the watcher.
                             if this.upgrade().is_none() {
                                 break;
                             }

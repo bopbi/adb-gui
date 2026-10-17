@@ -33,14 +33,17 @@ impl Feature for RestartApp {
         if input != FeatureInput::None {
             return Ok(());
         }
-        let package = foreground_app::current_package(client, serial)?;
-        client.shell(serial, &["am", "force-stop", &package])?;
+        let app = foreground_app::current_app(client, serial)?;
+        let user = app.user.to_string();
+        client.shell(serial, &["am", "force-stop", "--user", &user, &app.package])?;
+        // `monkey` has no `--user` flag, so the relaunch always targets the
+        // current user even when the stopped app lived in another profile.
         client.shell(
             serial,
             &[
                 "monkey",
                 "-p",
-                &package,
+                &app.package,
                 "-c",
                 "android.intent.category.LAUNCHER",
                 "1",
@@ -66,7 +69,7 @@ mod tests {
             test_util::logged(&log),
             [
                 "-s s shell dumpsys activity activities".to_string(),
-                format!("-s s shell am force-stop {FOREGROUND_PACKAGE}"),
+                format!("-s s shell am force-stop --user 0 {FOREGROUND_PACKAGE}"),
                 format!(
                     "-s s shell monkey -p {FOREGROUND_PACKAGE} -c android.intent.category.LAUNCHER 1"
                 ),

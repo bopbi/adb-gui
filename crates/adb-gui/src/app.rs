@@ -269,7 +269,7 @@ impl AppView {
                         if let InputEvent::PressEnter { .. } = event {
                             let text = input.read(cx).value().to_string();
                             if !text.is_empty() {
-                                this.dispatch(ix, FeatureInput::Text(text), window, cx);
+                                this.on_feature_input(ix, FeatureInput::Text(text), window, cx);
                             }
                         }
                     },
@@ -375,7 +375,10 @@ impl AppView {
     }
 
     /// Mirror each choice cell's batched state into its dropdown so the
-    /// select shows the device's current option.
+    /// select shows the device's current option. A cell whose state is not a
+    /// `Value` (a choice with no read-back, e.g. network speed) keeps the
+    /// user's last selection; after a device switch such a cell may still
+    /// show the previous device's selection.
     fn sync_choice_selections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for ix in 0..self.cells.len() {
             let (Some(choice), FeatureKind::Choice(options)) = (
@@ -384,10 +387,10 @@ impl AppView {
             ) else {
                 continue;
             };
-            let selected = match &self.cells[ix].state {
-                FeatureState::Value(tag) => options.iter().position(|opt| opt.id == *tag),
-                _ => None,
+            let FeatureState::Value(tag) = &self.cells[ix].state else {
+                continue;
             };
+            let selected = options.iter().position(|opt| opt.id == *tag);
             choice.update(cx, |state, cx| match selected {
                 Some(row) => state.set_selected_value(&row, window, cx),
                 None => state.set_selected_index(None, window, cx),

@@ -625,6 +625,111 @@ fn destructive_action_waits_for_confirmation(cx: &mut TestAppContext) {
     );
 }
 
+/// A destructive TextAction must not bypass the confirmation when submitted
+/// with Enter: the dialog opens first and nothing is dispatched until
+/// confirmed.
+#[gpui_kit::test]
+fn destructive_text_action_waits_for_confirmation_on_enter(cx: &mut TestAppContext) {
+    let executor = Arc::new(RecordingExecutor::new());
+    let handle = open_app(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        executor.clone(),
+    );
+    settle(cx, handle);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.click("feature-input:simulate.snapshot-load", cx);
+        window.input("clean-state", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dialog").is_some(),
+            "Enter on a destructive text action must open the confirmation dialog"
+        );
+    })
+    .unwrap();
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::Perform { .. })),
+        "no perform may be dispatched before confirmation; calls: {:?}",
+        executor.calls()
+    );
+
+    cx.update_window(handle, |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        executor.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::Perform {
+                feature_id: "simulate.snapshot-load",
+                input: InputSummary::Text(text),
+                ..
+            } if text == "clean-state"
+        )),
+        "confirming must dispatch the typed snapshot name; calls: {:?}",
+        executor.calls()
+    );
+}
+
+/// A choice with no read-back (network speed reads `FeatureState::None`)
+/// keeps the user's selection after the post-perform refresh.
+#[gpui_kit::test]
+fn choice_without_read_back_keeps_its_selection_after_refresh(cx: &mut TestAppContext) {
+    let executor = Arc::new(RecordingExecutor::new());
+    let handle = open_app(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        executor.clone(),
+    );
+    settle(cx, handle);
+
+    cx.update_window(handle, |_, window, cx| {
+        window
+            .within("feature-choice:network.speed")
+            .click("input", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let calls = executor.calls();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            RecordedCall::Perform {
+                feature_id: "network.speed",
+                ..
+            }
+        )),
+        "confirming an option must dispatch network.speed; calls: {calls:?}"
+    );
+    cx.update_window(handle, |_, window, _cx| {
+        assert!(
+            window
+                .find("feature-choice:network.speed")
+                .value()
+                .is_some_and(|value| !value.is_empty()),
+            "the selection must survive the refresh whose state is None"
+        );
+    })
+    .unwrap();
+}
+
 /// K3: the screenshot must reach the system clipboard even when the
 /// post-perform batched re-read fails — the clipboard offer is gated on the
 /// perform, not the re-read.

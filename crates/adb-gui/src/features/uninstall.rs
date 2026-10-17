@@ -33,8 +33,14 @@ impl Feature for Uninstall {
         serial: &str,
         input: FeatureInput,
     ) -> Result<(), AdbError> {
-        perform_action(client, serial, input, |pkg| {
-            vec!["pm".into(), "uninstall".into(), pkg.into()]
+        perform_action(client, serial, input, |app| {
+            vec![
+                "pm".into(),
+                "uninstall".into(),
+                "--user".into(),
+                app.user.to_string(),
+                app.package.clone(),
+            ]
         })
     }
 }
@@ -54,7 +60,7 @@ mod tests {
             test_util::logged(&log),
             [
                 "-s s shell dumpsys activity activities".to_string(),
-                format!("-s s shell pm uninstall {FOREGROUND_PACKAGE}"),
+                format!("-s s shell pm uninstall --user 0 {FOREGROUND_PACKAGE}"),
             ],
         );
         test_util::clean_up(&log);

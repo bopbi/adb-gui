@@ -20,4 +20,4 @@ pub use client::{AdbClient, ShellChild};
 pub use device::{Device, DeviceState, parse_devices};
 pub use error::{AdbError, Result};
 pub use sdk::find_adb;
-pub use track::spawn_device_watcher;
+pub use track::{DeviceWatcher, spawn_device_watcher};

@@ -15,6 +15,12 @@ pub const FOREGROUND_PACKAGE: &str = "com.example.app";
 /// record for [`FOREGROUND_PACKAGE`]; every argv is appended to `log`.
 /// `name` must be unique per test (parallel tests share the fixture dir).
 pub fn fake_adb(name: &str, log: &Path) -> PathBuf {
+    fake_adb_for_user(name, log, 0)
+}
+
+/// Like [`fake_adb`], but the foreground record belongs to Android user
+/// `user` (`u<user>`), as for a work-profile app.
+pub fn fake_adb_for_user(name: &str, log: &Path, user: u32) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("adb-gui-app-actions-test-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
@@ -23,7 +29,7 @@ pub fn fake_adb(name: &str, log: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
              if [ \"$4\" = \"dumpsys\" ]; then\n\
-             \x20 printf '  topResumedActivity=ActivityRecord{{a1b2c3 u0 {pkg}/.MainActivity t7}}\\n'\n\
+             \x20 printf '  topResumedActivity=ActivityRecord{{a1b2c3 u{user} {pkg}/.MainActivity t7}}\\n'\n\
              fi\n\
              exit 0\n",
             log = log.display(),
@@ -71,12 +77,34 @@ pub fn fake_adb_emu(name: &str, log: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
              case \"$*\" in\n\
-             *'emu power display') printf 'OK\\nAC: connected\\nstatus: Charging\\ncapacity: 50\\n' ;;
+             *'emu power display') printf 'OK\\nAC: online\\nstatus: Charging\\nhealth: Good\\npresent: true\\ncapacity: 50\\n' ;;
              *'emu power capacity') printf 'KO: missing argument\\n' ;;\n\
              *'settings get global wifi_on') printf '1\\n' ;;\n\
              *'settings get global mobile_data') printf '1\\n' ;;\n\
              esac\n\
              exit 0\n",
+            log = log.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Fake adb whose every command logs its argv, prints a stderr line, and
+/// exits non-zero — for failure-path tests. `name` must be unique per test.
+pub fn fake_adb_failing(name: &str, log: &Path) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("adb-gui-fail-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
+             echo 'Exception occurred while executing' >&2\n\
+             exit 1\n",
             log = log.display(),
         ),
     )

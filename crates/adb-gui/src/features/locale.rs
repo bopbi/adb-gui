@@ -1,5 +1,7 @@
 //! Locale choice: `cmd locale set-device-locale <tag>` over preset tags,
-//! including RTL (ar-EG) and pseudo-locales (en-XA, ar-XB).
+//! including RTL (ar-EG) and pseudo-locales (en-XA, ar-XB). The command only
+//! exists from Android 16 QPR2 (API 36.1); on older devices it fails and the
+//! error says so.
 
 use adb_core::{AdbClient, AdbError};
 
@@ -110,7 +112,17 @@ impl Feature for Locale {
         if option.id == "default" {
             return Ok(());
         }
-        client.shell(serial, &["cmd", "locale", "set-device-locale", option.id])?;
+        client
+            .shell(serial, &["cmd", "locale", "set-device-locale", option.id])
+            .map_err(|err| match err {
+                AdbError::CommandFailed { command, stderr } => AdbError::CommandFailed {
+                    command,
+                    stderr: format!(
+                        "{stderr} (setting the device-wide locale requires Android 16 QPR2 / API 36.1 or later)"
+                    ),
+                },
+                other => other,
+            })?;
         Ok(())
     }
 }
@@ -209,6 +221,31 @@ mod tests {
                     "-s s shell cmd locale set-device-locale ar-EG",
                     "-s s shell cmd locale set-device-locale en-XA",
                 ],
+            );
+            let _ = fs::remove_file(&log);
+        }
+
+        #[test]
+        fn perform_explains_the_api_requirement_when_the_command_fails() {
+            let log = std::env::temp_dir()
+                .join(format!("adb-gui-locale-fail-log-{}", std::process::id()));
+            let _ = fs::remove_file(&log);
+            let client = AdbClient::new(crate::features::test_util::fake_adb_failing(
+                "fake-adb-locale-fail",
+                &log,
+            ));
+            let ar_ix = OPTIONS.iter().position(|o| o.id == "ar-EG").unwrap();
+            let err = Locale
+                .perform(&client, "s", FeatureInput::Index(ar_ix))
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("API 36.1"),
+                "error must name the API requirement: {message}"
+            );
+            assert!(
+                message.contains("Exception occurred"),
+                "the device's own error must be kept: {message}"
             );
             let _ = fs::remove_file(&log);
         }

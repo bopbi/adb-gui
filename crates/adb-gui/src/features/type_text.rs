@@ -34,10 +34,32 @@ impl Feature for TypeText {
         if text.is_empty() {
             return Ok(());
         }
-        let command = format!("input text {}", quote_for_shell(&text));
-        client.shell(serial, &[&command])?;
+        // AOSP's `input text` turns the substring `%s` into a space, so no
+        // single invocation may contain one: each `%` goes out on its own.
+        for segment in segments_around_percent(&text) {
+            let command = format!("input text {}", quote_for_shell(segment));
+            client.shell(serial, &[&command])?;
+        }
         Ok(())
     }
+}
+
+/// Split `text` so every `%` is its own segment and the text between
+/// percents stays intact; empty segments are skipped.
+fn segments_around_percent(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (ix, _) in text.match_indices('%') {
+        if ix > start {
+            segments.push(&text[start..ix]);
+        }
+        segments.push(&text[ix..=ix]);
+        start = ix + 1;
+    }
+    if start < text.len() {
+        segments.push(&text[start..]);
+    }
+    segments
 }
 
 #[cfg(test)]
@@ -110,6 +132,47 @@ mod tests {
                     "-s serial123 shell input text 'it'\\''s $(rm -rf /) \"quoted\"'",
                 ],
                 "text must be single-quote quoted so the device shell cannot expand it"
+            );
+            let _ = fs::remove_file(&log);
+        }
+
+        #[test]
+        fn perform_splits_percent_so_input_text_never_sees_percent_s() {
+            let log = std::env::temp_dir().join(format!("adb-gui-tt-log3-{}", std::process::id()));
+            let _ = fs::remove_file(&log);
+            let client = AdbClient::new(fake_adb(&log));
+            let feature = TypeText;
+
+            feature
+                .perform(
+                    &client,
+                    "serial123",
+                    FeatureInput::Text("value=%s".to_string()),
+                )
+                .unwrap();
+            feature
+                .perform(
+                    &client,
+                    "serial123",
+                    FeatureInput::Text("100%%".to_string()),
+                )
+                .unwrap();
+
+            let lines: Vec<String> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    "-s serial123 shell input text 'value='",
+                    "-s serial123 shell input text '%'",
+                    "-s serial123 shell input text 's'",
+                    "-s serial123 shell input text '100'",
+                    "-s serial123 shell input text '%'",
+                    "-s serial123 shell input text '%'",
+                ],
             );
             let _ = fs::remove_file(&log);
         }

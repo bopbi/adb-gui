@@ -82,6 +82,11 @@ impl Feature for SnapshotLoad {
         Availability::EmulatorOnly
     }
 
+    /// Loading discards all state created since the snapshot was saved.
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn perform(
         &self,
         client: &AdbClient,

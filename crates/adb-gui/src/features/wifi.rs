@@ -12,7 +12,7 @@ pub struct Wifi;
 
 impl Wifi {
     pub fn apply(&self, state: &BatchedState) -> FeatureState {
-        FeatureState::Toggle(state.get(WIFI_ON).trim() == "1")
+        FeatureState::Toggle(matches!(state.get(WIFI_ON).trim(), "1" | "2"))
     }
 }
 
@@ -75,11 +75,14 @@ mod tests {
         fn with_wifi(value: &str) -> BatchedState {
             state_reader::parse(&format!("1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n{value}\n"))
         }
-        assert!(matches!(
-            feature.apply(&with_wifi("1")),
-            FeatureState::Toggle(true)
-        ));
-        for raw in ["0", "2", "null", ""] {
+        // `wifi_on` is 1 (enabled) or 2 (enabled while in airplane mode).
+        for raw in ["1", "2"] {
+            assert!(
+                matches!(feature.apply(&with_wifi(raw)), FeatureState::Toggle(true)),
+                "value {raw:?} must map to on"
+            );
+        }
+        for raw in ["0", "null", ""] {
             assert!(
                 matches!(feature.apply(&with_wifi(raw)), FeatureState::Toggle(false)),
                 "value {raw:?} must map to off"

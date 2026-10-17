@@ -1,7 +1,9 @@
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -9,23 +11,78 @@ use crate::device::{Device, parse_devices};
 
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Start a background thread running `adb track-devices` and stream device
-/// list snapshots over the returned channel. The watcher kills the adb
-/// child and exits when the receiver is dropped, and respawns adb if the
-/// track-devices process dies.
-pub fn spawn_device_watcher(adb_path: PathBuf) -> (JoinHandle<()>, Receiver<Vec<Device>>) {
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || watcher_loop(adb_path, tx));
-    (handle, rx)
+/// Guard for a running device watcher. `stop()` (or dropping the guard)
+/// kills the current adb child, so the watcher's blocked read sees EOF and
+/// the thread exits even when no device change ever arrives. `stop()` also
+/// joins the thread; dropping without stopping shuts adb down but does not
+/// wait for the thread.
+pub struct DeviceWatcher {
+    handle: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
-fn watcher_loop(adb_path: PathBuf, tx: mpsc::Sender<Vec<Device>>) {
+impl DeviceWatcher {
+    /// Shut the watcher down and wait for its thread to exit.
+    pub fn stop(mut self) {
+        self.initiate_shutdown();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn initiate_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = slot.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        self.initiate_shutdown();
+    }
+}
+
+/// Start a background thread running `adb track-devices` and stream device
+/// list snapshots over the returned channel. The returned guard stops the
+/// watcher deterministically (`stop()` or Drop); a dropped receiver remains
+/// a fallback exit path. The watcher respawns adb if the track-devices
+/// process dies, unless shutdown was requested.
+pub fn spawn_device_watcher(adb_path: PathBuf) -> (DeviceWatcher, Receiver<Vec<Device>>) {
+    let (tx, rx) = mpsc::channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(None));
+    let handle = std::thread::spawn({
+        let shutdown = shutdown.clone();
+        let child = child.clone();
+        move || watcher_loop(adb_path, tx, shutdown, child)
+    });
+    let watcher = DeviceWatcher {
+        handle: Some(handle),
+        shutdown,
+        child,
+    };
+    (watcher, rx)
+}
+
+fn watcher_loop(
+    adb_path: PathBuf,
+    tx: mpsc::Sender<Vec<Device>>,
+    shutdown: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+) {
     loop {
-        match run_watcher(&adb_path, &tx) {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        match run_watcher(&adb_path, &tx, &shutdown, &child) {
             Ok(()) => {
-                // adb process exited (crash, server kill): brief backoff,
-                // then respawn. If the receiver is gone the next send
-                // fails and we exit.
+                // adb process exited (crash, server kill, or stop() kill):
+                // brief backoff, then respawn — unless shutdown was requested.
+                // If the receiver is gone the next send fails and we exit.
                 std::thread::sleep(RESPAWN_BACKOFF);
             }
             Err(()) => return, // receiver disconnected
@@ -34,7 +91,12 @@ fn watcher_loop(adb_path: PathBuf, tx: mpsc::Sender<Vec<Device>>) {
 }
 
 /// Returns Ok(()) when the adb child exits, Err(()) when the receiver is gone.
-fn run_watcher(adb_path: &PathBuf, tx: &mpsc::Sender<Vec<Device>>) -> Result<(), ()> {
+fn run_watcher(
+    adb_path: &PathBuf,
+    tx: &mpsc::Sender<Vec<Device>>,
+    shutdown: &AtomicBool,
+    shared_child: &Mutex<Option<Child>>,
+) -> Result<(), ()> {
     let mut child: Child = std::process::Command::new(adb_path)
         .args(["track-devices"])
         .stdin(Stdio::null())
@@ -44,28 +106,48 @@ fn run_watcher(adb_path: &PathBuf, tx: &mpsc::Sender<Vec<Device>>) -> Result<(),
         .map_err(|_| ())?;
 
     let stdout = child.stdout.take().expect("piped stdout");
+    // Publish the child so stop() can kill it while the read below blocks;
+    // if shutdown raced the spawn, kill immediately instead of blocking.
+    {
+        let mut slot = shared_child.lock().unwrap_or_else(|e| e.into_inner());
+        if shutdown.load(Ordering::SeqCst) {
+            let _ = child.kill();
+        }
+        *slot = Some(child);
+    }
     let mut reader = BufReader::new(stdout);
 
-    loop {
+    let result = loop {
         // Every frame is the COMPLETE current device list: the payload of a
         // frame replaces the snapshot wholesale, so a device absent from a
         // frame is gone (AOSP SERVICES.TXT: track-devices sends a full
         // device-list description, hex-length-framed, on every change).
         let snapshot = match read_frame(&mut reader) {
             Ok(Some(payload)) => parse_devices(&String::from_utf8_lossy(&payload)),
-            // EOF: adb exited. Probe the channel once so a dropped receiver
-            // ends the thread even when no further device changes arrive.
-            Ok(None) => return probe(tx),
+            // EOF: adb exited (or stop() killed it). Probe the channel once
+            // so a dropped receiver ends the thread even when no further
+            // device changes arrive.
+            Ok(None) => break probe(tx),
             // Malformed frame or read error: respawn adb.
-            Err(()) => return Ok(()),
+            Err(()) => break Ok(()),
         };
         // Send failure means the receiver was dropped: kill adb and exit.
         if tx.send(snapshot).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(());
+            break Err(());
         }
+    };
+
+    // Reap the child whether it exited, was killed by stop(), or is still
+    // running because the receiver went away.
+    if let Some(mut child) = shared_child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    result
 }
 
 /// Post-EOF probe: report one (possibly empty) snapshot so a receiver that
@@ -211,16 +293,22 @@ mod tests {
             }
         }
 
-        fn exit_after_receiver_drop(handle: JoinHandle<()>, rx: Receiver<Vec<Device>>) {
+        fn exit_after_receiver_drop(watcher: DeviceWatcher, rx: Receiver<Vec<Device>>) {
             drop(rx); // receiver gone: watcher must exit at the next send
+            stop_within(watcher, "watcher thread did not exit after receiver drop");
+        }
+
+        /// Stop the watcher on a helper thread and fail if it takes too long
+        /// (a hung join would otherwise block the test forever).
+        fn stop_within(watcher: DeviceWatcher, message: &str) {
             let (done_tx, done_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = done_tx.send(handle.join());
+                watcher.stop();
+                let _ = done_tx.send(());
             });
             done_rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("watcher thread did not exit after receiver drop")
-                .expect("watcher thread panicked");
+                .expect(message);
         }
 
         #[test]
@@ -237,7 +325,7 @@ printf '002C'; printf '32081FDH2000CY\tdevice\nemulator-5554\toffline\n'
 exit 0"#,
             );
 
-            let (handle, rx) = spawn_device_watcher(adb);
+            let (watcher, rx) = spawn_device_watcher(adb);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
             let first = collect_until(&rx, deadline, |snapshot| snapshot.len() == 2);
@@ -266,7 +354,7 @@ exit 0"#,
                 "later frames must not leak their prefix either"
             );
 
-            exit_after_receiver_drop(handle, rx);
+            exit_after_receiver_drop(watcher, rx);
         }
 
         #[test]
@@ -282,7 +370,7 @@ printf '0015'; printf 'emulator-5554\tdevice\n'
 exit 0"#,
             );
 
-            let (handle, rx) = spawn_device_watcher(adb);
+            let (watcher, rx) = spawn_device_watcher(adb);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
             let first = collect_until(&rx, deadline, |snapshot| snapshot.len() == 2);
@@ -294,7 +382,7 @@ exit 0"#,
             assert_eq!(second.len(), 1);
             assert_eq!(second[0].state, DeviceState::Device);
 
-            exit_after_receiver_drop(handle, rx);
+            exit_after_receiver_drop(watcher, rx);
         }
 
         #[test]
@@ -307,14 +395,14 @@ printf '0000'
 exit 0"#,
             );
 
-            let (handle, rx) = spawn_device_watcher(adb);
+            let (watcher, rx) = spawn_device_watcher(adb);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
             collect_until(&rx, deadline, |snapshot| snapshot.len() == 1);
             let empty = collect_until(&rx, deadline, |snapshot| snapshot.is_empty());
             assert!(empty.is_empty());
 
-            exit_after_receiver_drop(handle, rx);
+            exit_after_receiver_drop(watcher, rx);
         }
 
         #[test]
@@ -331,7 +419,7 @@ exit 0"#,
             // Safety: read only by the fake adb spawned by this test.
             unsafe { std::env::set_var("ADB_GUI_TRACK_COUNTER", &counter) };
 
-            let (handle, rx) = spawn_device_watcher(adb);
+            let (watcher, rx) = spawn_device_watcher(adb);
             rx.recv().expect("initial snapshot");
 
             // adb exits after each print; the watcher should respawn it.
@@ -350,7 +438,24 @@ exit 0"#,
 
             unsafe { std::env::remove_var("ADB_GUI_TRACK_COUNTER") };
             let _ = fs::remove_file(&counter);
-            exit_after_receiver_drop(handle, rx);
+            exit_after_receiver_drop(watcher, rx);
+        }
+
+        #[test]
+        fn stop_ends_a_silent_watcher_promptly() {
+            // The PM1 defect: with a stable device list no frame arrives, so
+            // the old watcher stayed blocked in read_frame forever. The fake
+            // here never writes and never exits; stop() must kill the child
+            // so the blocked read sees EOF and the thread exits promptly.
+            // `exec` makes sleep the child process itself, so killing the
+            // child is not masked by a shell waiting on a grandchild.
+            let adb = script("fake-track-silent", "exec sleep 60");
+
+            let (watcher, rx) = spawn_device_watcher(adb);
+            // Keep the receiver alive: the exit must come from the guard,
+            // not the receiver-drop fallback.
+            stop_within(watcher, "watcher did not exit after stop()");
+            drop(rx);
         }
     }
 }

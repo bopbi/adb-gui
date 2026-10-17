@@ -53,6 +53,14 @@ impl Feature for IncomingSms {
                 stderr: "message must not be empty".to_string(),
             });
         }
+        // `adb emu` joins argv into one line-oriented console command, so an
+        // interior line break would start a second console command.
+        if message.contains(['\n', '\r']) {
+            return Err(AdbError::CommandFailed {
+                command: "sms send".to_string(),
+                stderr: "message must be a single line".to_string(),
+            });
+        }
         let number = incoming_call::normalize_number("sms send", number)?;
         // The console tokenizes on whitespace and takes the rest of the line
         // as the message — it is NOT a shell, so no quoting: pass the raw
@@ -105,6 +113,27 @@ mod tests {
                     .to_string()
             ],
         );
+        test_util::clean_up(&log);
+    }
+
+    #[test]
+    fn sms_rejects_an_interior_newline_without_touching_the_device() {
+        let log = test_util::log_path("sms-newline");
+        let client = AdbClient::new(test_util::fake_adb_emu("fake-adb-sms-newline", &log));
+        for bad in ["5551234: hi\nkill", "5551234: hi\r\npower off"] {
+            let err = IncomingSms
+                .perform(
+                    &client,
+                    "emulator-5554",
+                    FeatureInput::Text(bad.to_string()),
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("single line"),
+                "newline input {bad:?} must fail clearly: {err}"
+            );
+        }
+        assert!(!log.exists(), "rejected input must not touch the device");
         test_util::clean_up(&log);
     }
 

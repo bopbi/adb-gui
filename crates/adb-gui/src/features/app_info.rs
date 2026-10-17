@@ -28,14 +28,16 @@ impl Feature for AppInfo {
         serial: &str,
         input: FeatureInput,
     ) -> Result<(), AdbError> {
-        perform_action(client, serial, input, |pkg| {
+        perform_action(client, serial, input, |app| {
             vec![
                 "am".into(),
                 "start".into(),
+                "--user".into(),
+                app.user.to_string(),
                 "-a".into(),
                 "android.settings.APPLICATION_DETAILS_SETTINGS".into(),
                 "-d".into(),
-                format!("package:{pkg}"),
+                format!("package:{}", app.package),
             ]
         })
     }
@@ -56,7 +58,7 @@ mod tests {
             [
                 "-s s shell dumpsys activity activities".to_string(),
                 format!(
-                    "-s s shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:{FOREGROUND_PACKAGE}"
+                    "-s s shell am start --user 0 -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:{FOREGROUND_PACKAGE}"
                 ),
             ],
         );

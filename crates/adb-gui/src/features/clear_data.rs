@@ -33,8 +33,14 @@ impl Feature for ClearData {
         serial: &str,
         input: FeatureInput,
     ) -> Result<(), AdbError> {
-        perform_action(client, serial, input, |pkg| {
-            vec!["pm".into(), "clear".into(), pkg.into()]
+        perform_action(client, serial, input, |app| {
+            vec![
+                "pm".into(),
+                "clear".into(),
+                "--user".into(),
+                app.user.to_string(),
+                app.package.clone(),
+            ]
         })
     }
 }
@@ -54,8 +60,24 @@ mod tests {
             test_util::logged(&log),
             [
                 "-s s shell dumpsys activity activities".to_string(),
-                format!("-s s shell pm clear {FOREGROUND_PACKAGE}"),
+                format!("-s s shell pm clear --user 0 {FOREGROUND_PACKAGE}"),
             ],
+        );
+        test_util::clean_up(&log);
+    }
+
+    #[test]
+    fn clear_data_targets_the_foreground_apps_user() {
+        let log = test_util::log_path("clear-data-user");
+        let client = AdbClient::new(test_util::fake_adb_for_user(
+            "fake-adb-clear-data-user",
+            &log,
+            10,
+        ));
+        ClearData.perform(&client, "s", FeatureInput::None).unwrap();
+        assert_eq!(
+            test_util::logged(&log).last().map(String::as_str),
+            Some(format!("-s s shell pm clear --user 10 {FOREGROUND_PACKAGE}").as_str()),
         );
         test_util::clean_up(&log);
     }

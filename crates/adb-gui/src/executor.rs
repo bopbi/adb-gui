@@ -96,7 +96,7 @@ mod tests {
             .read_all(client, features, "emulator-5554".to_string())
             .expect("read_all");
 
-        // fake_adb_emu answers `emu power display` with `AC: connected`.
+        // fake_adb_emu answers `emu power display` with `AC: online`.
         assert!(
             matches!(states[1], FeatureState::Toggle(true)),
             "charging cell must reflect the console's AC line"
