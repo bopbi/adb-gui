@@ -129,14 +129,14 @@ mod tests {
 
         #[test]
         fn start_then_stop_pulls_and_cleans_up() {
-            let _env = crate::features::test_util::ENV_LOCK.lock().unwrap();
+            let _env = crate::features::test_util::CAPTURE_DIR_LOCK.lock().unwrap();
             let pid = std::process::id();
             let log = std::env::temp_dir().join(format!("adb-gui-rec-log-{pid}"));
             let marker = std::env::temp_dir().join(format!("adb-gui-rec-pulled-{pid}"));
             let _ = fs::remove_file(&log);
             let _ = fs::remove_file(&marker);
             // Keep pulled recordings out of the developer's Pictures dir.
-            crate::features::test_util::use_scratch_home_locked("record");
+            crate::features::test_util::use_scratch_capture_dir_locked("record");
             let client = AdbClient::new(fake_adb("fake-adb-record", &log, &marker));
             let feature = ScreenRecord::new();
 
@@ -198,13 +198,14 @@ mod tests {
         /// the temp dir) and stashes a notice naming the path.
         #[test]
         fn stop_falls_back_and_stashes_a_notice() {
-            let _env = crate::features::test_util::ENV_LOCK.lock().unwrap();
+            let _env = crate::features::test_util::CAPTURE_DIR_LOCK.lock().unwrap();
             let pid = std::process::id();
             let log = std::env::temp_dir().join(format!("adb-gui-rec-fallback-log-{pid}"));
             let marker = std::env::temp_dir().join(format!("adb-gui-rec-fallback-{pid}"));
             let _ = fs::remove_file(&log);
             let _ = fs::remove_file(&marker);
-            let home = crate::features::test_util::use_scratch_home_locked("record-fallback");
+            let home =
+                crate::features::test_util::use_scratch_capture_dir_locked("record-fallback");
             fs::write(home.join("Pictures"), b"not a dir").unwrap();
             let client = AdbClient::new(fake_adb("fake-adb-record-fallback", &log, &marker));
             let feature = ScreenRecord::new();

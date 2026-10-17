@@ -134,11 +134,11 @@ mod tests {
 
         #[test]
         fn perform_captures_via_exec_out_and_saves_png() {
-            let _env = crate::features::test_util::ENV_LOCK.lock().unwrap();
+            let _env = crate::features::test_util::CAPTURE_DIR_LOCK.lock().unwrap();
             let log = std::env::temp_dir().join(format!("adb-gui-shot-log-{}", std::process::id()));
             let _ = fs::remove_file(&log);
             // Keep the saved PNG out of the developer's Pictures dir.
-            let home = crate::features::test_util::use_scratch_home_locked("screenshot");
+            let home = crate::features::test_util::use_scratch_capture_dir_locked("screenshot");
             let client = AdbClient::new(fake_adb("fake-adb-shot", &log));
             let feature = Screenshot::new();
 
@@ -172,11 +172,11 @@ mod tests {
         /// saves (to the temp dir) and stashes a notice naming the path.
         #[test]
         fn perform_falls_back_and_stashes_a_notice() {
-            let _env = crate::features::test_util::ENV_LOCK.lock().unwrap();
+            let _env = crate::features::test_util::CAPTURE_DIR_LOCK.lock().unwrap();
             let log = std::env::temp_dir()
                 .join(format!("adb-gui-shot-fallback-log-{}", std::process::id()));
             let _ = fs::remove_file(&log);
-            let home = crate::features::test_util::use_scratch_home_locked("shot-fallback");
+            let home = crate::features::test_util::use_scratch_capture_dir_locked("shot-fallback");
             // A file where the Pictures directory would be makes Pictures
             // unwritable.
             fs::write(home.join("Pictures"), b"not a dir").unwrap();

@@ -28,19 +28,24 @@ pub fn current_package(client: &AdbClient, serial: &str) -> Result<String, AdbEr
 }
 
 /// Shared perform body for foreground-app actions — the single consumption
-/// point for [`current_app`]: resolve the foreground app, then run the
-/// command `build` derives from it. No-ops on any input other than
-/// `FeatureInput::None` (what action cells dispatch).
+/// point for [`current_app`]. `FeatureInput::None` (what action cells
+/// dispatch) resolves the foreground app live, then runs the command
+/// `build` derives from it; `FeatureInput::PinnedTarget` is a target the
+/// app layer already resolved before its confirmation dialog, so it is used
+/// as-is — no `dumpsys` call. No-ops on any other input.
 pub fn perform_action(
     client: &AdbClient,
     serial: &str,
     input: crate::feature::FeatureInput,
     build: fn(&ForegroundApp) -> Vec<String>,
 ) -> Result<(), AdbError> {
-    if input != crate::feature::FeatureInput::None {
-        return Ok(());
-    }
-    let app = current_app(client, serial)?;
+    let app = match input {
+        crate::feature::FeatureInput::None => current_app(client, serial)?,
+        crate::feature::FeatureInput::PinnedTarget { package, user } => {
+            ForegroundApp { package, user }
+        }
+        _ => return Ok(()),
+    };
     let owned: Vec<String> = build(&app);
     let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
     client.shell(serial, &argv)?;

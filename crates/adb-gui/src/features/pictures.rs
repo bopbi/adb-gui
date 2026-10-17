@@ -3,12 +3,27 @@
 //! where their output paths live.
 
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use adb_core::AdbError;
 
+/// Process-level override consulted first by [`pictures_dir`]. Test-only
+/// seam: the `ui_shell` integration binary and capture tests redirect output
+/// here instead of mutating `HOME`; production never sets it.
+static CAPTURE_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+#[doc(hidden)]
+pub fn set_capture_dir_override(dir: Option<PathBuf>) {
+    *CAPTURE_DIR_OVERRIDE.write().unwrap() = dir;
+}
+
+/// The capture output dir: the override when set, else
 /// `~/Pictures/adb-gui/` (macOS/Linux) or `%USERPROFILE%\Pictures\adb-gui\`
 /// (Windows).
 pub fn pictures_dir() -> PathBuf {
+    if let Some(dir) = CAPTURE_DIR_OVERRIDE.read().unwrap().as_deref() {
+        return dir.to_path_buf();
+    }
     let home = if cfg!(windows) {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
     } else {

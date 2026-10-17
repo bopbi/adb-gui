@@ -36,6 +36,11 @@ enum InputSummary {
     Index(usize),
     Text(String),
     Reset,
+    /// A target resolved before the confirmation dialog opened.
+    PinnedTarget {
+        package: String,
+        user: u32,
+    },
 }
 
 /// The seam UI tests stub out: records calls, reflects Bool performs back in
@@ -90,6 +95,10 @@ impl FeatureExecutor for RecordingExecutor {
             FeatureInput::Index(ix) => InputSummary::Index(*ix),
             FeatureInput::Text(text) => InputSummary::Text(text.clone()),
             FeatureInput::Reset => InputSummary::Reset,
+            FeatureInput::PinnedTarget { package, user } => InputSummary::PinnedTarget {
+                package: package.clone(),
+                user: *user,
+            },
         };
         self.calls.lock().unwrap().push(RecordedCall::Perform {
             feature_id: feature.id(),
@@ -172,7 +181,7 @@ fn open_app_with_client(
                     Default::default(),
                     // Tall enough for every catalog cell to be visible without
                     // scrolling — UI tests click cells directly.
-                    size(px(360.), px(2200.)),
+                    size(px(360.), px(4200.)),
                 ))),
                 ..Default::default()
             },
@@ -572,9 +581,11 @@ fn destructive_action_waits_for_confirmation(cx: &mut TestAppContext) {
     settle(cx, handle);
 
     // Clicking a destructive cell opens the confirmation dialog and must NOT
-    // dispatch.
+    // dispatch. (reset-permissions is destructive but device-wide — it keeps
+    // the generic path; foreground-targeted destructive actions resolve
+    // before the dialog, see destructive_foreground_action_resolves_before_confirm.)
     cx.update_window(handle, |_, window, cx| {
-        window.click("feature-action:app.clear-data", cx);
+        window.click("feature-action:app.reset-permissions", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -617,12 +628,135 @@ fn destructive_action_waits_for_confirmation(cx: &mut TestAppContext) {
         matches!(
             performs[0],
             RecordedCall::Perform {
-                feature_id: "app.clear-data",
+                feature_id: "app.reset-permissions",
                 ..
             }
         ),
-        "the confirmed action must be clear-data; calls: {calls:?}"
+        "the confirmed action must be reset-permissions; calls: {calls:?}"
     );
+}
+
+/// R3-A: a destructive foreground-app action resolves its target BEFORE the
+/// confirmation dialog opens. The dialog names the pre-dialog foreground app,
+/// and the confirmed perform carries that pinned target — the fake adb starts
+/// reporting a different foreground app once the dialog is open, so any
+/// re-resolution at perform time would target the wrong app.
+#[gpui_kit::test]
+#[cfg(unix)]
+fn destructive_foreground_action_resolves_before_confirm(cx: &mut TestAppContext) {
+    let (fake_adb, log) = shifting_foreground_fake_adb();
+    let executor = Arc::new(RecordingExecutor::new());
+    executor.set_delegate_perform(true);
+    let handle = open_app_with_client(
+        cx,
+        vec![usable_device("emulator-5554", "sdk_gphone64")],
+        executor.clone(),
+        AdbClient::new(fake_adb),
+    );
+    settle(cx, handle);
+
+    // Clicking the destructive cell resolves the foreground app first; the
+    // dialog opens only once the resolve finished, naming the target.
+    cx.update_window(handle, |_, window, cx| {
+        window.click("feature-action:app.clear-data", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("dialog").is_some(),
+            "destructive foreground click must open the confirmation dialog"
+        );
+        assert_eq!(
+            window.find("confirm-description").label(),
+            Some("This action targets com.before.dialog (user 0). This action cannot be undone."),
+            "the dialog must name the app resolved before it opened"
+        );
+    })
+    .unwrap();
+    assert!(
+        executor
+            .calls()
+            .iter()
+            .all(|call| !matches!(call, RecordedCall::Perform { .. })),
+        "no perform may be dispatched before confirmation; calls: {:?}",
+        executor.calls()
+    );
+
+    // The foreground app "changes" while the dialog is open (the fake adb
+    // answers every `dumpsys` after the first with a different app).
+    // Confirming must still run the command against the pinned pre-dialog
+    // target — a perform-time re-resolution would name com.changed.after.
+    cx.update_window(handle, |_, window, cx| {
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        executor.calls().iter().any(|call| matches!(
+            call,
+            RecordedCall::Perform {
+                feature_id: "app.clear-data",
+                input: InputSummary::PinnedTarget { package, user },
+                ..
+            } if package == "com.before.dialog" && *user == 0
+        )),
+        "confirming must dispatch the pre-dialog pinned target; calls: {:?}",
+        executor.calls()
+    );
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        logged.matches("dumpsys activity activities").count(),
+        1,
+        "exactly one resolution (before the dialog) may happen; log: {logged}"
+    );
+    assert!(
+        logged.contains("-s emulator-5554 shell pm clear --user 0 com.before.dialog"),
+        "the executed command must carry the pinned target; log: {logged}"
+    );
+    assert!(
+        !logged.contains("com.changed.after"),
+        "the performed command must not target the app that became foreground later; log: {logged}"
+    );
+}
+
+/// Fake adb whose FIRST `dumpsys activity activities` answers with
+/// `com.before.dialog` (the pre-dialog resolve) and every later one with
+/// `com.changed.after` (a foreground switch while the dialog is open). Logs
+/// every argv to the returned log path. Returns the fake adb path and log.
+#[cfg(unix)]
+fn shifting_foreground_fake_adb() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("adb-gui-ui-shift-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("argv.log");
+    let count = dir.join("dumpsys-count");
+    let path = dir.join("fake-adb-ui-shift");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$4\" = \"dumpsys\" ]; then\n\
+             \x20 n=$(cat \"{count}\" 2>/dev/null || echo 0)\n\
+             \x20 echo $((n + 1)) > \"{count}\"\n\
+             \x20 if [ \"$n\" = \"0\" ]; then\n\
+             \x20   printf '  topResumedActivity=ActivityRecord{{a1b2c3 u0 com.before.dialog/.MainActivity t7}}\\n'\n\
+             \x20 else\n\
+             \x20   printf '  topResumedActivity=ActivityRecord{{a1b2c3 u10 com.changed.after/.MainActivity t7}}\\n'\n\
+             \x20 fi\n\
+             fi\n\
+             exit 0\n",
+            log = log.display(),
+            count = count.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    (path, log)
 }
 
 /// A destructive TextAction must not bypass the confirmation when submitted
@@ -735,11 +869,10 @@ fn choice_without_read_back_keeps_its_selection_after_refresh(cx: &mut TestAppCo
 /// perform, not the re-read.
 #[gpui_kit::test]
 fn screenshot_clipboard_survives_failed_reread(cx: &mut TestAppContext) {
-    // Keep the saved PNG out of the developer's Pictures dir. Safety: only
-    // this test in the ui_shell binary reads HOME.
+    // Keep the saved PNG out of the developer's Pictures dir.
     let scratch = std::env::temp_dir().join(format!("adb-gui-ui-home-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
-    unsafe { std::env::set_var("HOME", &scratch) };
+    adb_gui::pictures::set_capture_dir_override(Some(scratch.clone()));
 
     let executor = Arc::new(RecordingExecutor::new());
     executor.set_delegate_perform(true);

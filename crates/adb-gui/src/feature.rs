@@ -89,6 +89,16 @@ pub enum FeatureInput {
     Text(String),
     /// Step back to the device's default (relative steppers with reset).
     Reset,
+    /// The target of a destructive foreground-app action, resolved BEFORE
+    /// the confirmation dialog opened. The perform must not re-resolve the
+    /// foreground app: a foreground switch while the dialog is open would
+    /// otherwise retarget the action. Fields are named directly (rather than
+    /// reusing `features::foreground_app::ForegroundApp`) so this module
+    /// stays free of that dependency.
+    PinnedTarget {
+        package: String,
+        user: u32,
+    },
 }
 
 /// Bytes the app should place on the system clipboard after a successful
@@ -113,6 +123,15 @@ pub trait Feature: Send + Sync {
         Availability::Always
     }
     fn is_destructive(&self) -> bool {
+        false
+    }
+    /// Whether the feature acts on the foreground app. Destructive features
+    /// that do opt in resolve their target BEFORE the confirmation dialog
+    /// opens and dispatch it as [`FeatureInput::PinnedTarget`], so a
+    /// foreground switch while the dialog is open cannot retarget the
+    /// action. Default: false (resolve at perform time, as non-destructive
+    /// foreground actions do — no dialog, no staleness window).
+    fn targets_foreground_app(&self) -> bool {
         false
     }
     /// Payload to offer the system clipboard after a successful `perform`

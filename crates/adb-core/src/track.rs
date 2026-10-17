@@ -412,12 +412,11 @@ exit 0"#,
             let _ = fs::remove_file(&counter);
             let adb = script(
                 "fake-track-respawn",
-                r#"echo x >> "$ADB_GUI_TRACK_COUNTER"
-printf '0015'; printf 'emulator-5554\tdevice\n'
-exit 0"#,
+                &format!(
+                    "echo x >> \"{counter}\"\nprintf '0015'; printf 'emulator-5554\\tdevice\\n'\nexit 0",
+                    counter = counter.display(),
+                ),
             );
-            // Safety: read only by the fake adb spawned by this test.
-            unsafe { std::env::set_var("ADB_GUI_TRACK_COUNTER", &counter) };
 
             let (watcher, rx) = spawn_device_watcher(adb);
             rx.recv().expect("initial snapshot");
@@ -436,7 +435,6 @@ exit 0"#,
                 "adb was respawned only {invocations} time(s)"
             );
 
-            unsafe { std::env::remove_var("ADB_GUI_TRACK_COUNTER") };
             let _ = fs::remove_file(&counter);
             exit_after_receiver_drop(watcher, rx);
         }

@@ -27,6 +27,10 @@ impl Feature for Uninstall {
         true
     }
 
+    fn targets_foreground_app(&self) -> bool {
+        true
+    }
+
     fn perform(
         &self,
         client: &AdbClient,
@@ -62,6 +66,30 @@ mod tests {
                 "-s s shell dumpsys activity activities".to_string(),
                 format!("-s s shell pm uninstall --user 0 {FOREGROUND_PACKAGE}"),
             ],
+        );
+        test_util::clean_up(&log);
+    }
+
+    #[test]
+    fn uninstall_with_pinned_target_skips_live_resolution() {
+        assert!(Uninstall.targets_foreground_app());
+        let log = test_util::log_path("uninstall-pinned");
+        let client = AdbClient::new(test_util::fake_adb("fake-adb-uninstall-pinned", &log));
+        // The app layer resolved the target before its confirmation dialog;
+        // the perform must use it as-is — no `dumpsys` round trip.
+        Uninstall
+            .perform(
+                &client,
+                "s",
+                FeatureInput::PinnedTarget {
+                    package: "com.pinned.app".to_string(),
+                    user: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            test_util::logged(&log),
+            ["-s s shell pm uninstall --user 10 com.pinned.app".to_string()],
         );
         test_util::clean_up(&log);
     }

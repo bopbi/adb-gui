@@ -14,7 +14,9 @@ pub use app::AppView;
 pub use device_store::{DeviceStore, DeviceStoreEvent};
 pub use executor::{AdbExecutor, FeatureExecutor};
 pub use feature::{
-    Availability, ChoiceOption, Feature, FeatureInput, FeatureKind, FeatureRegistry, FeatureState,
-    Section, StepperSpec,
+    Availability, ChoiceOption, ClipboardPayload, Feature, FeatureInput, FeatureKind,
+    FeatureRegistry, FeatureState, Section, StepperSpec,
 };
 pub use features::all_features;
+#[doc(hidden)]
+pub use features::pictures;

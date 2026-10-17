@@ -31,6 +31,7 @@ use crate::feature::{
     FeatureState, StepperSpec,
 };
 use crate::features::all_features;
+use crate::features::foreground_app;
 use crate::features::install_apk::INSTALL_APK_ID;
 
 /// One option of a feature's `Choice` cell, as shown in its per-cell
@@ -406,7 +407,14 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let feature = self.registry.features()[ix].clone();
-        if feature.is_destructive() {
+        if feature.is_destructive() && feature.targets_foreground_app() {
+            // The dialog must name the app that will actually be targeted,
+            // and the confirmed perform must not re-resolve the foreground
+            // app — a foreground switch while the dialog is open would
+            // otherwise retarget the action. Resolve first, pin the result
+            // into the dispatched input.
+            self.confirm_destructive_foreground_app(ix, window, cx);
+        } else if feature.is_destructive() {
             let weak = cx.entity().downgrade();
             let title = format!("Run “{}”?", feature.title());
             let input = Rc::new(RefCell::new(Some(input)));
@@ -433,6 +441,83 @@ impl AppView {
         } else {
             self.dispatch(ix, input, window, cx);
         }
+    }
+
+    /// Resolve the foreground app, then open the destructive feature's
+    /// confirmation dialog naming that target; confirming dispatches it as
+    /// `FeatureInput::PinnedTarget` so the perform cannot re-resolve (and
+    /// silently retarget) while the dialog was open. A resolution failure
+    /// surfaces as an error notification and never opens the dialog.
+    fn confirm_destructive_foreground_app(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(serial) = self.selected_serial.clone() else {
+            return;
+        };
+        let feature = self.registry.features()[ix].clone();
+        let feature_id = feature.id();
+        let client = self.client.clone();
+        let weak = cx.entity().downgrade();
+        cx.spawn_in(window, async move |this, cx| {
+            let resolved = cx
+                .background_spawn(async move { foreground_app::current_app(&client, &serial) })
+                .await;
+            this.update_in(cx, |_this, window, cx| {
+                let app = match resolved {
+                    Ok(app) => app,
+                    Err(err) => {
+                        window.push_notification(
+                            Notification::error(format!("{feature_id}: {err}")),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                let title = format!("Run “{}”?", feature.title());
+                let description = format!(
+                    "This action targets {} (user {}). This action cannot be undone.",
+                    app.package, app.user
+                );
+                let pinned = Rc::new(RefCell::new(Some(FeatureInput::PinnedTarget {
+                    package: app.package,
+                    user: app.user,
+                })));
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    alert
+                        .title(title.clone())
+                        // Wrapped (not passed as a bare string) so the test
+                        // harness can observe the named target; the aria
+                        // label carries the same text to assistive tech.
+                        .description(
+                            div()
+                                .id("confirm-description")
+                                .test_support()
+                                .aria_label(description.clone())
+                                .child(description.clone()),
+                        )
+                        .confirm()
+                        .ok_text("Continue")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok({
+                            let weak = weak.clone();
+                            let pinned = pinned.clone();
+                            move |_, window, cx| {
+                                if let Some(input) = pinned.borrow_mut().take() {
+                                    let _ = weak.update(cx, |view, cx| {
+                                        view.dispatch(ix, input, window, cx);
+                                    });
+                                }
+                                true
+                            }
+                        })
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Run the feature command on a background thread, then re-read every

@@ -241,14 +241,14 @@ fi"#,
 
     #[test]
     fn shell_forwards_serial_and_args() {
+        let log = std::env::temp_dir().join(format!("adb-gui-args-{}", std::process::id()));
         let adb = script(
             "fake-adb-shell",
-            r#"printf '%s\n' "$@" >> "$ADB_GUI_ARGS_LOG"
-printf 'hello stdout'"#,
+            &format!(
+                "printf '%s\\n' \"$@\" >> \"{log}\"\nprintf 'hello stdout'",
+                log = log.display(),
+            ),
         );
-        let log = std::env::temp_dir().join(format!("adb-gui-args-{}", std::process::id()));
-        // Safety: the var is read only by the fake adb spawned by this test.
-        unsafe { std::env::set_var("ADB_GUI_ARGS_LOG", &log) };
         let client = AdbClient::new(adb);
         let out = client.shell("serial123", &["echo", "ok"]).unwrap();
         assert_eq!(out, "hello stdout");
@@ -259,7 +259,6 @@ printf 'hello stdout'"#,
             ["-s", "serial123", "shell", "echo", "ok"],
             "adb argv must be forwarded exactly"
         );
-        unsafe { std::env::remove_var("ADB_GUI_ARGS_LOG") };
     }
 
     #[test]
